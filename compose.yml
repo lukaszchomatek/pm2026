@@ -1,0 +1,60 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  mongo:
+    image: mongo:8
+    container_name: mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  users:
+    build: ./users
+    container_name: users
+    ports:
+      - "3001:3001"
+    environment:
+      PORT: 3001
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: super-secret-jwt-key
+    depends_on:
+      - redis
+
+  posts:
+    build: ./posts
+    container_name: posts
+    ports:
+      - "3002:3002"
+    environment:
+      PORT: 3002
+      MONGO_URL: mongodb://mongo:27017/postsdb
+      JWT_SECRET: super-secret-jwt-key
+      SENTIMENT_URL: http://sentiment:8000/predict
+    depends_on:
+      - mongo
+      - sentiment
+
+  sentiment:
+    build: ./sentiment
+    container_name: sentiment
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_ID: cardiffnlp/twitter-roberta-base-sentiment-latest
+      USE_GPU: "1"
+      LOG_LEVEL: INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  mongo_data:
