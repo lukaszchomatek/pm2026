@@ -50,8 +50,7 @@ demo-microservices/
       ├─ core
       ├─ services
       ├─ __init__.py
-      ├─ bootstrap.py
-      └─ model.py
+      └─ bootstrap.py
 ```
 
 ## Wymagania
