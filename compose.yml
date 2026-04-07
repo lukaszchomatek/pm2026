@@ -1,3 +1,31 @@
+x-hf-service: &hf-service
+  build: ./hf-model-service
+  environment:
+    MODEL_REVISION: main
+    USE_GPU: "1"
+    LOG_LEVEL: INFO
+    HF_HOME: /hf
+  volumes:
+    - hf_cache:/hf
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "python",
+        "-c",
+        "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read(); sys.exit(0)"
+      ]
+    interval: 30s
+    timeout: 5s
+    retries: 5
+    start_period: 120s
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
 services:
   redis:
     image: redis:7-alpine
@@ -62,105 +90,43 @@ services:
         condition: service_healthy
 
   sentiment:
-    build: ./hf-model-service
+    <<: *hf-service
     container_name: sentiment
     ports:
       - "8000:8000"
     environment:
-      SERVICE_KIND: sentiment
-      MODEL_ID: cardiffnlp/twitter-roberta-base-sentiment-latest
       MODEL_REVISION: main
       USE_GPU: "1"
       LOG_LEVEL: INFO
       HF_HOME: /hf
-    volumes:
-      - hf_cache:/hf
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read(); sys.exit(0)"
-        ]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 120s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      SERVICE_KIND: sentiment
+      MODEL_ID: cardiffnlp/twitter-roberta-base-sentiment-latest
 
   toxicity:
-    build: ./hf-model-service
+    <<: *hf-service
     container_name: toxicity
     ports:
       - "8001:8000"
     environment:
-      SERVICE_KIND: toxicity
-      MODEL_ID: unitary/toxic-bert
       MODEL_REVISION: main
       USE_GPU: "1"
       LOG_LEVEL: INFO
       HF_HOME: /hf
-    volumes:
-      - hf_cache:/hf
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read(); sys.exit(0)"
-        ]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 120s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      SERVICE_KIND: toxicity
+      MODEL_ID: unitary/toxic-bert
+
   zeroshot:
-    build: ./hf-model-service
+    <<: *hf-service
     container_name: zeroshot
     ports:
       - "8002:8000"
     environment:
-      SERVICE_KIND: zeroshot
-      MODEL_ID: facebook/bart-large-mnli
       MODEL_REVISION: main
       USE_GPU: "1"
       LOG_LEVEL: INFO
       HF_HOME: /hf
-    volumes:
-      - hf_cache:/hf
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read(); sys.exit(0)"
-        ]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 120s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      SERVICE_KIND: zeroshot
+      MODEL_ID: facebook/bart-large-mnli
 volumes:
   mongo_data:
   hf_cache:
