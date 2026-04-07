@@ -1,12 +1,11 @@
 import logging
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 
 from app.core.config import build_config
 from app.core.middleware import add_request_id
 from app.core.model_loader import get_model
-
 
 logger = logging.getLogger("hf-inference-service")
 
@@ -39,8 +38,39 @@ def create_app(service_module) -> FastAPI:
 
     app.middleware("http")(add_request_id)
 
-    @app.get("/health")
-    def health():
+    @app.get("/health/live")
+    def live():
+        return {
+            "status": "ok",
+            "service": config.service_name,
+        }
+
+    @app.get("/health/ready")
+    def ready():
+        try:
+            get_model(
+                task=config.task,
+                model_id=config.model_id,
+                model_revision=config.model_revision,
+                use_gpu=config.use_gpu,
+                pipeline_kwargs=pipeline_kwargs,
+            )
+        except Exception as exc:
+            logger.exception(
+                "readiness_failed service=%s model=%s",
+                config.service_name,
+                config.model_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": "not_ready",
+                    "service": config.service_name,
+                    "model": config.model_id,
+                    "reason": str(exc),
+                },
+            )
+
         return {
             "status": "ok",
             "service": config.service_name,
@@ -50,6 +80,10 @@ def create_app(service_module) -> FastAPI:
             "endpoint": config.endpoint_path,
             "gpu_enabled": config.use_gpu,
         }
+
+    @app.get("/health")
+    def health():
+        return ready()
 
     @app.post(config.endpoint_path, response_model=service_module.ResponseModel)
     def predict(payload: service_module.RequestModel, request: Request):

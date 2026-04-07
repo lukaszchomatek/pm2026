@@ -4,6 +4,11 @@ services:
     container_name: redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   mongo:
     image: mongo:8
@@ -12,6 +17,12 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   users:
     build: ./users
@@ -41,10 +52,14 @@ services:
       ZERO_SHOT_MULTI_LABEL: "1"
       MODEL_TIMEOUT_MS: 10000
     depends_on:
-      - mongo
-      - sentiment
-      - toxicity
-      - zeroshot
+      mongo:
+        condition: service_healthy
+      sentiment:
+        condition: service_healthy
+      toxicity:
+        condition: service_healthy
+      zeroshot:
+        condition: service_healthy
 
   sentiment:
     build: ./hf-model-service
@@ -60,6 +75,18 @@ services:
       HF_HOME: /hf
     volumes:
       - hf_cache:/hf
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read(); sys.exit(0)"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
     deploy:
       resources:
         reservations:
@@ -82,6 +109,18 @@ services:
       HF_HOME: /hf
     volumes:
       - hf_cache:/hf
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read(); sys.exit(0)"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
     deploy:
       resources:
         reservations:
@@ -103,6 +142,18 @@ services:
       HF_HOME: /hf
     volumes:
       - hf_cache:/hf
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read(); sys.exit(0)"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
     deploy:
       resources:
         reservations:
