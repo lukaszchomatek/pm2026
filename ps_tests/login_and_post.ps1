@@ -13,7 +13,7 @@ $token = $loginResponse.token
 $token
 
 $body = @{
-    text = "Today's lecture is not so complex"
+    text = "I really hate Docker and it's compose files."
 } | ConvertTo-Json
 
 Invoke-RestMethod `
