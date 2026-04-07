@@ -34,20 +34,32 @@ services:
       PORT: 3002
       MONGO_URL: mongodb://mongo:27017/postsdb
       JWT_SECRET: super-secret-jwt-key
-      SENTIMENT_URL: http://sentiment:8000/predict
+      SENTIMENT_URL: http://sentiment:8000/predictsentiment
+      TOXICITY_URL: http://toxicity:8000/predicttoxicity
+      ZEROSHOT_URL: http://zeroshot:8000/predictzeroshot
+      ZERO_SHOT_LABELS: '["question","complaint","opinion","announcement","spam"]'
+      ZERO_SHOT_MULTI_LABEL: "1"
+      MODEL_TIMEOUT_MS: 10000
     depends_on:
       - mongo
       - sentiment
+      - toxicity
+      - zeroshot
 
   sentiment:
-    build: ./sentiment
+    build: ./hf-model-service
     container_name: sentiment
     ports:
       - "8000:8000"
     environment:
+      SERVICE_KIND: sentiment
       MODEL_ID: cardiffnlp/twitter-roberta-base-sentiment-latest
+      MODEL_REVISION: main
       USE_GPU: "1"
       LOG_LEVEL: INFO
+      HF_HOME: /hf
+    volumes:
+      - hf_cache:/hf
     deploy:
       resources:
         reservations:
@@ -56,5 +68,48 @@ services:
               count: 1
               capabilities: [gpu]
 
+  toxicity:
+    build: ./hf-model-service
+    container_name: toxicity
+    ports:
+      - "8001:8000"
+    environment:
+      SERVICE_KIND: toxicity
+      MODEL_ID: unitary/toxic-bert
+      MODEL_REVISION: main
+      USE_GPU: "1"
+      LOG_LEVEL: INFO
+      HF_HOME: /hf
+    volumes:
+      - hf_cache:/hf
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+  zeroshot:
+    build: ./hf-model-service
+    container_name: zeroshot
+    ports:
+      - "8002:8000"
+    environment:
+      SERVICE_KIND: zeroshot
+      MODEL_ID: facebook/bart-large-mnli
+      MODEL_REVISION: main
+      USE_GPU: "1"
+      LOG_LEVEL: INFO
+      HF_HOME: /hf
+    volumes:
+      - hf_cache:/hf
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 volumes:
   mongo_data:
+  hf_cache:

@@ -11,10 +11,6 @@ RUN pip install -r requirements.txt
 
 COPY app ./app
 
-ENV MODEL_ID=cardiffnlp/twitter-roberta-base-sentiment-latest
-ENV USE_GPU=1
-ENV LOG_LEVEL=INFO
-
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.bootstrap:app", "--host", "0.0.0.0", "--port", "8000"]

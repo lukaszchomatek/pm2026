@@ -1,5 +1,5 @@
 $body = @{
-    username = "lukas"
+    username = "lukas1"
     password = "haslohaslo"
 } | ConvertTo-Json
 
@@ -13,7 +13,7 @@ $token = $loginResponse.token
 $token
 
 $body = @{
-    text = "I was excited about today's lecture"
+    text = "Today's lecture is not so complex"
 } | ConvertTo-Json
 
 Invoke-RestMethod `

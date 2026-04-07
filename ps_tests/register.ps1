@@ -1,5 +1,5 @@
 $body = @{
-    username = "lukas"
+    username = "lukas1"
     password = "haslohaslo"
 } | ConvertTo-Json
 

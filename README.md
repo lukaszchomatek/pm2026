@@ -4,7 +4,7 @@ Prosta aplikacja demonstracyjna uruchamiana przez Docker Compose. Składa się z
 
 - `users` — rejestracja i logowanie użytkownika
 - `posts` — publikowanie postów przez zalogowanego użytkownika
-- `sentiment` — analiza sentymentu tekstu z użyciem modelu z Hugging Face
+- `hf-model-service` — analiza postów z użyciem modeli z Hugging Face (kilka wariantów)
 - `redis` — magazyn użytkowników
 - `mongo` — magazyn postów
 
@@ -17,20 +17,22 @@ Prosta aplikacja demonstracyjna uruchamiana przez Docker Compose. Składa się z
 - Usługa `posts` weryfikuje token JWT.
 - Usługa `posts` wysyła synchroniczne żądanie HTTP do `sentiment`.
 - Usługa `sentiment` analizuje tekst i zwraca wynik sentymentu.
+- Usługa `toxicity` sprawdza guardrails'y platformy (post jest publikowany tak czy tak)
+- Usługa `zeroshot` automatycznie nadaje kategorię postowi (i podaje poziomy dopasowania)
 - Usługa `posts` zapisuje post razem z wynikiem sentymentu w MongoDB.
 
 ## Stos technologiczny
 
 - `users`: Node.js, Express, Redis, JWT, bcrypt
 - `posts`: Node.js, Express, MongoDB, JWT
-- `sentiment`: Python, FastAPI, Hugging Face Transformers, PyTorch
+- `hf-models-service`: Python, FastAPI, Hugging Face Transformers, PyTorch
 - Orkiestracja lokalna: Docker Compose
 
 ## Struktura katalogów
 
 ```text
 demo-microservices/
-├─ docker-compose.yml
+├─ compose.yml
 ├─ users/
 │  ├─ Dockerfile
 │  ├─ package.json
@@ -41,12 +43,14 @@ demo-microservices/
 │  ├─ package.json
 │  └─ src/
 │     └─ index.js
-└─ sentiment/
+└─ hf-model-service/
    ├─ Dockerfile
    ├─ requirements.txt
    └─ app/
+      ├─ core
+      ├─ services
       ├─ __init__.py
-      ├─ main.py
+      ├─ bootstrap.py
       └─ model.py
 ```
 
@@ -54,11 +58,11 @@ demo-microservices/
 
 - Docker
 - Docker Compose
-- Dla usługi `sentiment`:
+- Dla usługi `hf-model-service`:
   - najlepiej Docker z obsługą GPU
   - poprawnie skonfigurowane sterowniki NVIDIA i środowisko kontenerowe GPU
 
-Aplikacja może działać także bez GPU, ale wtedy trzeba odpowiednio zmienić konfigurację usługi `sentiment`.
+Aplikacja może działać także bez GPU, ale wtedy trzeba odpowiednio zmienić konfigurację usługi `hf-model-service`.
 
 ## Uruchomienie
 
@@ -72,7 +76,10 @@ Po uruchomieniu dostępne będą usługi:
 
 - `users` — `http://localhost:3001`
 - `posts` — `http://localhost:3002`
-- `sentiment` — `http://localhost:8000`
+- `hf-model-service (sentiment)` — `http://localhost:8000`
+- `hf-model-service (toxicity)` — `http://localhost:8001`
+- `hf-model-service (zero-shot)` — `http://localhost:8002`
+
 
 ## Endpointy
 
@@ -252,7 +259,7 @@ Najważniejsze zmienne środowiskowe:
 - `JWT_SECRET`
 - `SENTIMENT_URL`
 
-### `sentiment`
+### `hf-model-service`
 
 - `MODEL_ID`
 - `USE_GPU`
@@ -288,11 +295,12 @@ Projekt ma charakter demonstracyjny. Celowo pominięto m.in.:
 - reset hasła
 - walidację siły hasła
 - dedykowaną usługę auth
-- retry i circuit breaker przy wywołaniu `sentiment`
+- retry i circuit breaker przy wywołaniu `hf-model-service`
 - centralne logowanie
 - metryki i tracing
 - testy automatyczne
-- trwały wolumen dla Redisa
+- kod w przypadku `hf-model-service` - są trzy pliki po to, żeby pokazać, że usługi mogą mieć różne API
+- brak trwałego wolumenu dla Redisa
 
 ## Możliwe rozszerzenia
 
