@@ -1,6 +1,7 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import { MongoClient } from "mongodb";
+import pRetry, { AbortError as PRetryAbortError } from "p-retry";
 
 const app = express();
 app.use(express.json());
@@ -12,7 +13,11 @@ const SENTIMENT_URL = process.env.SENTIMENT_URL;
 const TOXICITY_URL = process.env.TOXICITY_URL;
 const ZEROSHOT_URL = process.env.ZEROSHOT_URL;
 const MODEL_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS ?? 10000);
+const MODEL_RETRIES = Number(process.env.MODEL_RETRIES ?? 2);
+const MODEL_RETRY_MIN_TIMEOUT_MS = Number(process.env.MODEL_RETRY_MIN_TIMEOUT_MS ?? 250);
+const MODEL_RETRY_FACTOR = Number(process.env.MODEL_RETRY_FACTOR ?? 2);
 const ZERO_SHOT_MULTI_LABEL = process.env.ZERO_SHOT_MULTI_LABEL === "1";
+const TOXICITY_REVIEW_THRESHOLD = Number(process.env.TOXICITY_REVIEW_THRESHOLD ?? 0.7);
 
 function parseZeroShotLabels() {
   try {
@@ -83,7 +88,10 @@ async function callModel(url, body, requestId) {
 
     if (!response.ok) {
       const responseBody = await response.text();
-      throw new Error(`${url} -> ${response.status} ${responseBody}`);
+      const error = new Error(`${url} -> ${response.status} ${responseBody}`);
+      error.name = "HttpError";
+      error.httpStatus = response.status;
+      throw error;
     }
 
     return await response.json();
@@ -92,50 +100,199 @@ async function callModel(url, body, requestId) {
   }
 }
 
-async function enrichText(text, requestId) {
-  const results = await Promise.allSettled([
-    callModel(SENTIMENT_URL, { text }, requestId),
-    callModel(TOXICITY_URL, { text }, requestId),
-    callModel(
-      ZEROSHOT_URL,
+function classifyError(error) {
+  const rootError = error?.originalError ?? error;
+
+  if (rootError?.name === "AbortError") {
+    return "timeout";
+  }
+
+  if (typeof rootError?.httpStatus === "number") {
+    if (rootError.httpStatus >= 500) {
+      return "http_5xx";
+    }
+
+    if (rootError.httpStatus >= 400) {
+      return "http_4xx";
+    }
+  }
+
+  if (rootError?.name === "TypeError") {
+    return "network_error";
+  }
+
+  return "unknown_error";
+}
+
+function shouldRetryError(errorType) {
+  return errorType === "timeout" || errorType === "network_error" || errorType === "http_5xx";
+}
+
+async function callModelWithRetry(url, body, requestId) {
+  let attempts = 0;
+
+  try {
+    const result = await pRetry(
+      async () => {
+        attempts += 1;
+
+        try {
+          return await callModel(url, body, requestId);
+        } catch (error) {
+          const errorType = classifyError(error);
+
+          if (!shouldRetryError(errorType)) {
+            throw new PRetryAbortError(error);
+          }
+
+          throw error;
+        }
+      },
       {
+        retries: MODEL_RETRIES,
+        minTimeout: MODEL_RETRY_MIN_TIMEOUT_MS,
+        factor: MODEL_RETRY_FACTOR
+      }
+    );
+
+    return { result, attempts };
+  } catch (error) {
+    error.attempts = attempts;
+    throw error;
+  }
+}
+
+async function classifyWithFallback({ name, url, body, requestId, fallbackFactory, normalizer }) {
+  try {
+    const { result, attempts } = await callModelWithRetry(url, body, requestId);
+
+    return {
+      data: normalizer(result),
+      meta: {
+        status: "ok",
+        attempts,
+        errorType: null,
+        errorMessage: null,
+        source: "remote"
+      }
+    };
+  } catch (error) {
+    const errorType = classifyError(error);
+    const baseMeta = {
+      attempts: Number(error?.attempts ?? error?.attemptNumber ?? MODEL_RETRIES + 1),
+      errorType,
+      errorMessage: (error?.originalError?.message ?? error?.message) || `${name} classification failed`
+    };
+
+    try {
+      const fallback = fallbackFactory();
+
+      return {
+        data: fallback,
+        meta: {
+          status: "fallback_used",
+          ...baseMeta,
+          source: "fallback"
+        }
+      };
+    } catch {
+      return {
+        data: null,
+        meta: {
+          status: "failed",
+          ...baseMeta,
+          source: "fallback"
+        }
+      };
+    }
+  }
+}
+
+function containsToxicLabel(label) {
+  const normalized = String(label ?? "").toLowerCase();
+  return (
+    normalized.includes("toxic") ||
+    normalized.includes("hate") ||
+    normalized.includes("insult") ||
+    normalized.includes("threat") ||
+    normalized.includes("obscene")
+  );
+}
+
+function shouldReviewFromToxicity(toxicityResult, toxicityMeta) {
+  if (toxicityMeta.source !== "remote" || toxicityMeta.status !== "ok") {
+    return true;
+  }
+
+  if (!Array.isArray(toxicityResult)) {
+    return true;
+  }
+
+  return toxicityResult.some(item => {
+    const score = Number(item?.score ?? 0);
+    return score >= TOXICITY_REVIEW_THRESHOLD && containsToxicLabel(item?.label);
+  });
+}
+
+function resolvePostStatus(toxicityResult, toxicityMeta) {
+  if (toxicityMeta.status === "failed") {
+    return "CLASSIFICATION_FAILED";
+  }
+
+  if (shouldReviewFromToxicity(toxicityResult, toxicityMeta)) {
+    return "REVIEW_REQUIRED";
+  }
+
+  return "PUBLISHED";
+}
+
+async function enrichText(text, requestId) {
+  const [sentiment, toxicity, zeroshot] = await Promise.all([
+    classifyWithFallback({
+      name: "sentiment",
+      url: SENTIMENT_URL,
+      body: { text },
+      requestId,
+      fallbackFactory: () => ({ label: "unknown", score: 0 }),
+      normalizer: response => response.result?.[0] ?? null
+    }),
+    classifyWithFallback({
+      name: "toxicity",
+      url: TOXICITY_URL,
+      body: { text },
+      requestId,
+      fallbackFactory: () => [],
+      normalizer: response => response.result ?? []
+    }),
+    classifyWithFallback({
+      name: "zeroshot",
+      url: ZEROSHOT_URL,
+      body: {
         text,
         candidate_labels: ZERO_SHOT_LABELS,
         multi_label: ZERO_SHOT_MULTI_LABEL
       },
-      requestId
-    )
+      requestId,
+      fallbackFactory: () => null,
+      normalizer: response => ({
+        sequence: response.sequence,
+        labels: response.labels ?? [],
+        scores: response.scores ?? []
+      })
+    })
   ]);
 
-  const [sentimentResult, toxicityResult, zeroshotResult] = results;
+  const postStatus = resolvePostStatus(toxicity.data, toxicity.meta);
 
   return {
-    sentiment:
-      sentimentResult.status === "fulfilled"
-        ? (sentimentResult.value.result?.[0] ?? null)
-        : null,
-
-    toxicity:
-      toxicityResult.status === "fulfilled"
-        ? (toxicityResult.value.result ?? [])
-        : [],
-
-    zeroshot:
-      zeroshotResult.status === "fulfilled"
-        ? {
-            sequence: zeroshotResult.value.sequence,
-            labels: zeroshotResult.value.labels ?? [],
-            scores: zeroshotResult.value.scores ?? []
-          }
-        : null,
-
-    enrichmentErrors: {
-      sentiment:
-        sentimentResult.status === "rejected" ? sentimentResult.reason.message : null,
-      toxicity:
-        toxicityResult.status === "rejected" ? toxicityResult.reason.message : null,
-      zeroshot:
-        zeroshotResult.status === "rejected" ? zeroshotResult.reason.message : null
+    sentiment: sentiment.data,
+    toxicity: toxicity.data,
+    zeroshot: zeroshot.data,
+    status: postStatus,
+    classificationMeta: {
+      sentiment: sentiment.meta,
+      toxicity: toxicity.meta,
+      zeroshot: zeroshot.meta
     }
   };
 }
@@ -159,7 +316,8 @@ app.post("/posts", authMiddleware, async (req, res) => {
       sentiment: enrichment.sentiment,
       toxicity: enrichment.toxicity,
       zeroshot: enrichment.zeroshot,
-      enrichmentErrors: enrichment.enrichmentErrors,
+      status: enrichment.status,
+      classificationMeta: enrichment.classificationMeta,
       createdAt: new Date()
     };
 
@@ -172,7 +330,8 @@ app.post("/posts", authMiddleware, async (req, res) => {
       sentiment: post.sentiment,
       toxicity: post.toxicity,
       zeroshot: post.zeroshot,
-      enrichmentErrors: post.enrichmentErrors,
+      status: post.status,
+      classificationMeta: post.classificationMeta,
       createdAt: post.createdAt
     });
   } catch (err) {
@@ -183,7 +342,7 @@ app.post("/posts", authMiddleware, async (req, res) => {
 app.get("/posts", async (req, res) => {
   try {
     const posts = await postsCollection
-      .find({})
+      .find({ status: "PUBLISHED" })
       .sort({ createdAt: -1 })
       .limit(100)
       .toArray();
