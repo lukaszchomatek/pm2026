@@ -73,6 +73,7 @@ services:
       PORT: 3002
       MONGO_URL: mongodb://mongo:27017/postsdb
       JWT_SECRET: super-secret-jwt-key
+      USERS_URL: http://users:3001
       SENTIMENT_URL: http://sentiment:8000/predictsentiment
       TOXICITY_URL: http://toxicity:8000/predicttoxicity
       ZEROSHOT_URL: http://zeroshot:8000/predictzeroshot

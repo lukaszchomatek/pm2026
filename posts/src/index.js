@@ -9,6 +9,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3002;
 const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/postsdb";
 const JWT_SECRET = process.env.JWT_SECRET || "change-me";
+const USERS_URL = process.env.USERS_URL || "http://localhost:3001";
 const SENTIMENT_URL = process.env.SENTIMENT_URL;
 const TOXICITY_URL = process.env.TOXICITY_URL;
 const ZEROSHOT_URL = process.env.ZEROSHOT_URL;
@@ -297,6 +298,17 @@ async function enrichText(text, requestId) {
   };
 }
 
+async function fetchAuthorProfile(username) {
+  const url = `${USERS_URL}/users/${encodeURIComponent(username)}/profile`;
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`users service profile fetch failed: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
 app.post("/posts", authMiddleware, async (req, res) => {
   try {
     const { text } = req.body ?? {};
@@ -307,11 +319,19 @@ app.post("/posts", authMiddleware, async (req, res) => {
 
     const normalizedText = text.trim();
     const requestId = crypto.randomUUID();
+    const authorProfile = await fetchAuthorProfile(req.user.username);
 
     const enrichment = await enrichText(normalizedText, requestId);
 
     const post = {
       author: req.user.username,
+      authorId: req.user.username,
+      authorSnapshot: {
+        username: authorProfile.username,
+        displayName: authorProfile.displayName,
+        role: authorProfile.role,
+        group: authorProfile.group
+      },
       text: normalizedText,
       sentiment: enrichment.sentiment,
       toxicity: enrichment.toxicity,
@@ -326,6 +346,8 @@ app.post("/posts", authMiddleware, async (req, res) => {
     res.status(201).json({
       id: insertResult.insertedId,
       author: post.author,
+      authorId: post.authorId,
+      authorSnapshot: post.authorSnapshot,
       text: post.text,
       sentiment: post.sentiment,
       toxicity: post.toxicity,
@@ -336,6 +358,10 @@ app.post("/posts", authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+    if (err?.message?.includes("users service profile fetch failed")) {
+      return res.status(503).json({ error: "users service unavailable" });
+    }
+
     res.status(500).json({ error: "internal error" });
   }
 });
