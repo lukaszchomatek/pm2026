@@ -15,6 +15,7 @@ Prosta aplikacja demonstracyjna uruchamiana przez Docker Compose. Składa się z
 - Po poprawnym logowaniu `users` zwraca token JWT.
 - Zalogowany użytkownik wysyła żądanie do `posts`, aby opublikować post.
 - Usługa `posts` weryfikuje token JWT.
+- Usługa `posts` pobiera profil autora z `users` i zapisuje jego snapshot razem z postem.
 - Usługa `posts` wysyła synchroniczne żądanie HTTP do `sentiment`.
 - Usługa `sentiment` analizuje tekst i zwraca wynik sentymentu.
 - Usługa `toxicity` sprawdza guardrails'y platformy (post jest publikowany tak czy tak)
@@ -102,8 +103,19 @@ Przykładowe body:
 ```json
 {
   "username": "user1",
-  "password": "tajnehaslo"
+  "password": "tajnehaslo",
+  "displayName": "User One",
+  "role": "student",
+  "group": "default"
 }
+```
+
+Pola `displayName`, `role`, `group` są opcjonalne.
+
+#### Profil użytkownika (do integracji między usługami)
+
+```http
+GET /users/:username/profile
 ```
 
 #### Logowanie
@@ -256,6 +268,7 @@ Najważniejsze zmienne środowiskowe:
 - `PORT`
 - `MONGO_URL`
 - `JWT_SECRET`
+- `USERS_URL`
 - `SENTIMENT_URL`
 
 ### `hf-model-service`

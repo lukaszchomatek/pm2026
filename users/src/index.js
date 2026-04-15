@@ -29,11 +29,21 @@ app.get("/health", async (req, res) => {
 
 app.post("/register", async (req, res) => {
   try {
-    const { username, password } = req.body ?? {};
+    const {
+      username,
+      password,
+      displayName: rawDisplayName,
+      role: rawRole,
+      group: rawGroup
+    } = req.body ?? {};
 
     if (!username || !password) {
       return res.status(400).json({ error: "username and password are required" });
     }
+
+    const displayName = rawDisplayName?.trim() || username;
+    const role = rawRole?.trim() || "student";
+    const group = rawGroup?.trim() || "default";
 
     const key = `user:${username}`;
     const existing = await redis.get(key);
@@ -48,11 +58,38 @@ app.post("/register", async (req, res) => {
       key,
       JSON.stringify({
         username,
-        passwordHash
+        passwordHash,
+        displayName,
+        role,
+        group
       })
     );
 
     res.status(201).json({ message: "user registered" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+app.get("/users/:username/profile", async (req, res) => {
+  try {
+    const { username } = req.params;
+    const key = `user:${username}`;
+    const raw = await redis.get(key);
+
+    if (!raw) {
+      return res.status(404).json({ error: "user not found" });
+    }
+
+    const user = JSON.parse(raw);
+
+    res.json({
+      username: user.username,
+      displayName: user.displayName ?? user.username,
+      role: user.role ?? "student",
+      group: user.group ?? "default"
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "internal error" });
