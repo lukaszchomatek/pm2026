@@ -1,6 +1,8 @@
 $body = @{
-    username = "lukas1"
+    username = "lukas2"
     password = "haslohaslo"
+
+
 } | ConvertTo-Json
 
 Invoke-RestMethod `

@@ -349,19 +349,8 @@ async function createPendingPost({ authorUsername, authorProfile, text }) {
     updatedAt: now
   };
 
-  const session = mongoClient.startSession();
-  let insertedId;
-
-  try {
-    await session.withTransaction(async () => {
-      const result = await postsCollection.insertOne(pendingPost, { session });
-      insertedId = result.insertedId;
-    });
-  } finally {
-    await session.endSession();
-  }
-
-  return { insertedId };
+  const result = await postsCollection.insertOne(pendingPost);
+  return { insertedId: result.insertedId };
 }
 
 async function enrichText(text, requestId) {
