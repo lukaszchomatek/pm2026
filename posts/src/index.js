@@ -19,6 +19,15 @@ const MODEL_RETRY_MIN_TIMEOUT_MS = Number(process.env.MODEL_RETRY_MIN_TIMEOUT_MS
 const MODEL_RETRY_FACTOR = Number(process.env.MODEL_RETRY_FACTOR ?? 2);
 const ZERO_SHOT_MULTI_LABEL = process.env.ZERO_SHOT_MULTI_LABEL === "1";
 const TOXICITY_REVIEW_THRESHOLD = Number(process.env.TOXICITY_REVIEW_THRESHOLD ?? 0.7);
+const SPAM_REVIEW_THRESHOLD = Number(process.env.SPAM_REVIEW_THRESHOLD ?? 0.9);
+
+const POST_STATUS = Object.freeze({
+  DRAFT: "DRAFT",
+  PENDING_CLASSIFICATION: "PENDING_CLASSIFICATION",
+  PUBLISHED: "PUBLISHED",
+  REVIEW_REQUIRED: "REVIEW_REQUIRED",
+  CLASSIFICATION_FAILED: "CLASSIFICATION_FAILED"
+});
 
 function parseZeroShotLabels() {
   try {
@@ -45,6 +54,7 @@ const db = mongoClient.db();
 const postsCollection = db.collection("posts");
 
 await postsCollection.createIndex({ author: 1, createdAt: -1 });
+await postsCollection.createIndex({ status: 1, createdAt: -1 });
 
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -237,14 +247,121 @@ function shouldReviewFromToxicity(toxicityResult, toxicityMeta) {
 
 function resolvePostStatus(toxicityResult, toxicityMeta) {
   if (toxicityMeta.status === "failed") {
-    return "CLASSIFICATION_FAILED";
+    return POST_STATUS.CLASSIFICATION_FAILED;
   }
 
   if (shouldReviewFromToxicity(toxicityResult, toxicityMeta)) {
-    return "REVIEW_REQUIRED";
+    return POST_STATUS.REVIEW_REQUIRED;
   }
 
-  return "PUBLISHED";
+  return POST_STATUS.PUBLISHED;
+}
+
+function hasManyClassificationFailures(meta) {
+  const failedCount = Object.values(meta).filter(item => item?.status === "failed").length;
+  return failedCount >= 2;
+}
+
+function getHighestToxicityLabel(toxicityResult) {
+  if (!Array.isArray(toxicityResult) || toxicityResult.length === 0) {
+    return null;
+  }
+
+  return toxicityResult.reduce((highest, item) => {
+    const score = Number(item?.score ?? 0);
+
+    if (!highest || score > highest.score) {
+      return { label: String(item?.label ?? "unknown"), score };
+    }
+
+    return highest;
+  }, null);
+}
+
+function getStatusDecision({ sentiment, toxicity, zeroshot }) {
+  if (hasManyClassificationFailures({ sentiment: sentiment.meta, toxicity: toxicity.meta, zeroshot: zeroshot.meta })) {
+    return {
+      status: POST_STATUS.CLASSIFICATION_FAILED,
+      statusReason: "Multiple classifiers failed; moderation decision is technically unsafe."
+    };
+  }
+
+  if (toxicity.meta.status === "failed") {
+    return {
+      status: POST_STATUS.CLASSIFICATION_FAILED,
+      statusReason: "Toxicity classifier failed without a reliable decision fallback."
+    };
+  }
+
+  if (toxicity.meta.source !== "remote" || toxicity.meta.status !== "ok") {
+    return {
+      status: POST_STATUS.REVIEW_REQUIRED,
+      statusReason: "Toxicity used fallback data; manual review required."
+    };
+  }
+
+  const highestToxicity = getHighestToxicityLabel(toxicity.data);
+  if (highestToxicity && containsToxicLabel(highestToxicity.label) && highestToxicity.score >= TOXICITY_REVIEW_THRESHOLD) {
+    return {
+      status: POST_STATUS.REVIEW_REQUIRED,
+      statusReason: `Toxicity risk detected (${highestToxicity.label}: ${highestToxicity.score.toFixed(2)}).`
+    };
+  }
+
+  const spamLabelIndex = Array.isArray(zeroshot.data?.labels)
+    ? zeroshot.data.labels.findIndex(label => String(label).toLowerCase() === "spam")
+    : -1;
+  const spamScore = spamLabelIndex >= 0 ? Number(zeroshot.data?.scores?.[spamLabelIndex] ?? 0) : 0;
+  if (spamScore >= SPAM_REVIEW_THRESHOLD) {
+    return {
+      status: POST_STATUS.REVIEW_REQUIRED,
+      statusReason: `High spam probability from zeroshot (${spamScore.toFixed(2)}).`
+    };
+  }
+
+  return {
+    status: resolvePostStatus(toxicity.data, toxicity.meta),
+    statusReason: "Classification completed; post published."
+  };
+}
+
+async function createPendingPost({ authorUsername, authorProfile, text }) {
+  const now = new Date();
+  const pendingPost = {
+    author: authorUsername,
+    authorId: authorUsername,
+    authorSnapshot: {
+      username: authorProfile.username,
+      displayName: authorProfile.displayName,
+      role: authorProfile.role,
+      group: authorProfile.group
+    },
+    text,
+    status: POST_STATUS.PENDING_CLASSIFICATION,
+    statusReason: "Post stored; waiting for classifier responses.",
+    classificationStartedAt: now,
+    classificationCompletedAt: null,
+    sentiment: null,
+    toxicity: null,
+    zeroshot: null,
+    classificationMeta: null,
+    createdAt: now,
+    updatedAt: now
+  };
+
+  const session = mongoClient.startSession();
+  let insertedId;
+
+  try {
+    await session.withTransaction(async () => {
+      const result = await postsCollection.insertOne(pendingPost, { session });
+      insertedId = result.insertedId;
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  return { insertedId };
 }
 
 async function enrichText(text, requestId) {
@@ -283,13 +400,14 @@ async function enrichText(text, requestId) {
     })
   ]);
 
-  const postStatus = resolvePostStatus(toxicity.data, toxicity.meta);
+  const decision = getStatusDecision({ sentiment, toxicity, zeroshot });
 
   return {
     sentiment: sentiment.data,
     toxicity: toxicity.data,
     zeroshot: zeroshot.data,
-    status: postStatus,
+    status: decision.status,
+    statusReason: decision.statusReason,
     classificationMeta: {
       sentiment: sentiment.meta,
       toxicity: toxicity.meta,
@@ -320,42 +438,51 @@ app.post("/posts", authMiddleware, async (req, res) => {
     const normalizedText = text.trim();
     const requestId = crypto.randomUUID();
     const authorProfile = await fetchAuthorProfile(req.user.username);
-
-    const enrichment = await enrichText(normalizedText, requestId);
-
-    const post = {
-      author: req.user.username,
-      authorId: req.user.username,
-      authorSnapshot: {
-        username: authorProfile.username,
-        displayName: authorProfile.displayName,
-        role: authorProfile.role,
-        group: authorProfile.group
-      },
-      text: normalizedText,
-      sentiment: enrichment.sentiment,
-      toxicity: enrichment.toxicity,
-      zeroshot: enrichment.zeroshot,
-      status: enrichment.status,
-      classificationMeta: enrichment.classificationMeta,
-      createdAt: new Date()
-    };
-
-    const insertResult = await postsCollection.insertOne(post);
-
-    res.status(201).json({
-      id: insertResult.insertedId,
-      author: post.author,
-      authorId: post.authorId,
-      authorSnapshot: post.authorSnapshot,
-      text: post.text,
-      sentiment: post.sentiment,
-      toxicity: post.toxicity,
-      zeroshot: post.zeroshot,
-      status: post.status,
-      classificationMeta: post.classificationMeta,
-      createdAt: post.createdAt
+    const { insertedId } = await createPendingPost({
+      authorUsername: req.user.username,
+      authorProfile,
+      text: normalizedText
     });
+
+    let enrichment;
+
+    try {
+      enrichment = await enrichText(normalizedText, requestId);
+    } catch (classificationError) {
+      console.error(classificationError);
+      enrichment = {
+        sentiment: null,
+        toxicity: null,
+        zeroshot: null,
+        status: POST_STATUS.CLASSIFICATION_FAILED,
+        statusReason: "Unexpected classification pipeline failure.",
+        classificationMeta: {
+          sentiment: { status: "failed", source: "pipeline", errorMessage: classificationError?.message ?? "unknown error" },
+          toxicity: { status: "failed", source: "pipeline", errorMessage: classificationError?.message ?? "unknown error" },
+          zeroshot: { status: "failed", source: "pipeline", errorMessage: classificationError?.message ?? "unknown error" }
+        }
+      };
+    }
+
+    const completedAt = new Date();
+    await postsCollection.updateOne(
+      { _id: insertedId },
+      {
+        $set: {
+          sentiment: enrichment.sentiment,
+          toxicity: enrichment.toxicity,
+          zeroshot: enrichment.zeroshot,
+          status: enrichment.status,
+          statusReason: enrichment.statusReason,
+          classificationMeta: enrichment.classificationMeta,
+          classificationCompletedAt: completedAt,
+          updatedAt: completedAt
+        }
+      }
+    );
+
+    const finalPost = await postsCollection.findOne({ _id: insertedId });
+    res.status(201).json({ id: insertedId, ...finalPost });
   } catch (err) {
     console.error(err);
     if (err?.message?.includes("users service profile fetch failed")) {
@@ -367,8 +494,20 @@ app.post("/posts", authMiddleware, async (req, res) => {
 });
 app.get("/posts", async (req, res) => {
   try {
+    const statusQuery = typeof req.query.status === "string" ? req.query.status.trim() : "";
+    const statuses = statusQuery
+      ? statusQuery.split(",").map(item => item.trim()).filter(Boolean)
+      : [POST_STATUS.PUBLISHED];
+    const allowedStatuses = new Set(Object.values(POST_STATUS));
+    const invalidStatus = statuses.some(status => !allowedStatuses.has(status));
+
+    if (invalidStatus) {
+      return res.status(400).json({ error: "invalid status filter" });
+    }
+
+    const statusFilter = statuses.length === 1 ? statuses[0] : { $in: statuses };
     const posts = await postsCollection
-      .find({ status: "PUBLISHED" })
+      .find({ status: statusFilter })
       .sort({ createdAt: -1 })
       .limit(100)
       .toArray();
