@@ -354,6 +354,22 @@ app.get("/posts", async (req, res) => {
   }
 });
 
+// a method displays all posts, independently on the status
+app.get("/allposts", async (req, res) => {
+  try {
+    const posts = await postsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .toArray();
+
+    res.json(posts);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
 app.get("/posts/me", authMiddleware, async (req, res) => {
   try {
     const posts = await postsCollection
