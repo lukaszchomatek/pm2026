@@ -1,10 +1,9 @@
 import express from "express";
 import jwt from "jsonwebtoken";
-import { MongoClient } from "mongodb";
-import pRetry, { AbortError as PRetryAbortError } from "p-retry";
+import { ObjectId, MongoClient } from "mongodb";
 import { bootstrapRabbitMQ } from "./messaging/bootstrapRabbitMQ.js";
-import { ROUTING_KEYS } from "./messaging/classificationTopology.js";
-import { publishJson } from "./messaging/rabbit.js";
+import { QUEUES, ROUTING_KEYS } from "./messaging/classificationTopology.js";
+import { consumeJson, publishJson } from "./messaging/rabbit.js";
 
 const app = express();
 app.use(express.json());
@@ -13,16 +12,9 @@ const PORT = process.env.PORT || 3002;
 const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/postsdb";
 const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 const USERS_URL = process.env.USERS_URL || "http://localhost:3001";
-const SENTIMENT_URL = process.env.SENTIMENT_URL;
-const TOXICITY_URL = process.env.TOXICITY_URL;
-const ZEROSHOT_URL = process.env.ZEROSHOT_URL;
-const MODEL_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS ?? 10000);
-const MODEL_RETRIES = Number(process.env.MODEL_RETRIES ?? 2);
-const MODEL_RETRY_MIN_TIMEOUT_MS = Number(process.env.MODEL_RETRY_MIN_TIMEOUT_MS ?? 250);
-const MODEL_RETRY_FACTOR = Number(process.env.MODEL_RETRY_FACTOR ?? 2);
-const ZERO_SHOT_MULTI_LABEL = process.env.ZERO_SHOT_MULTI_LABEL === "1";
 const TOXICITY_REVIEW_THRESHOLD = Number(process.env.TOXICITY_REVIEW_THRESHOLD ?? 0.7);
 const SPAM_REVIEW_THRESHOLD = Number(process.env.SPAM_REVIEW_THRESHOLD ?? 0.9);
+const CONSUMER_PREFETCH = Number(process.env.POSTS_RESULTS_PREFETCH ?? 20);
 
 const POST_STATUS = Object.freeze({
   DRAFT: "DRAFT",
@@ -31,25 +23,9 @@ const POST_STATUS = Object.freeze({
   REVIEW_REQUIRED: "REVIEW_REQUIRED",
   CLASSIFICATION_FAILED: "CLASSIFICATION_FAILED"
 });
+
 const REQUESTED_CLASSIFIERS = Object.freeze(["sentiment", "toxicity", "zeroshot"]);
-
-function parseZeroShotLabels() {
-  try {
-    const parsed = JSON.parse(
-      process.env.ZERO_SHOT_LABELS ?? '["question","complaint","opinion","announcement","spam"]'
-    );
-
-    if (!Array.isArray(parsed) || parsed.length < 2) {
-      throw new Error("ZERO_SHOT_LABELS must be an array with at least 2 items");
-    }
-
-    return parsed.map(x => String(x).trim()).filter(Boolean);
-  } catch (err) {
-    throw new Error(`Invalid ZERO_SHOT_LABELS: ${err.message}`);
-  }
-}
-
-const ZERO_SHOT_LABELS = parseZeroShotLabels();
+const SUPPORTED_CLASSIFIERS = new Set(REQUESTED_CLASSIFIERS);
 
 const mongoClient = new MongoClient(MONGO_URL);
 await mongoClient.connect();
@@ -59,6 +35,7 @@ const postsCollection = db.collection("posts");
 
 await postsCollection.createIndex({ author: 1, createdAt: -1 });
 await postsCollection.createIndex({ status: 1, createdAt: -1 });
+await postsCollection.createIndex({ classificationRunId: 1 });
 
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -77,152 +54,6 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get("/health", async (req, res) => {
-  try {
-    await db.command({ ping: 1 });
-    res.json({ status: "ok" });
-  } catch {
-    res.status(500).json({ status: "error" });
-  }
-});
-
-async function callModel(url, body, requestId) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Request-Id": requestId
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-
-    if (!response.ok) {
-      const responseBody = await response.text();
-      const error = new Error(`${url} -> ${response.status} ${responseBody}`);
-      error.name = "HttpError";
-      error.httpStatus = response.status;
-      throw error;
-    }
-
-    return await response.json();
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function classifyError(error) {
-  const rootError = error?.originalError ?? error;
-
-  if (rootError?.name === "AbortError") {
-    return "timeout";
-  }
-
-  if (typeof rootError?.httpStatus === "number") {
-    if (rootError.httpStatus >= 500) {
-      return "http_5xx";
-    }
-
-    if (rootError.httpStatus >= 400) {
-      return "http_4xx";
-    }
-  }
-
-  if (rootError?.name === "TypeError") {
-    return "network_error";
-  }
-
-  return "unknown_error";
-}
-
-function shouldRetryError(errorType) {
-  return errorType === "timeout" || errorType === "network_error" || errorType === "http_5xx";
-}
-
-async function callModelWithRetry(url, body, requestId) {
-  let attempts = 0;
-
-  try {
-    const result = await pRetry(
-      async () => {
-        attempts += 1;
-
-        try {
-          return await callModel(url, body, requestId);
-        } catch (error) {
-          const errorType = classifyError(error);
-
-          if (!shouldRetryError(errorType)) {
-            throw new PRetryAbortError(error);
-          }
-
-          throw error;
-        }
-      },
-      {
-        retries: MODEL_RETRIES,
-        minTimeout: MODEL_RETRY_MIN_TIMEOUT_MS,
-        factor: MODEL_RETRY_FACTOR
-      }
-    );
-
-    return { result, attempts };
-  } catch (error) {
-    error.attempts = attempts;
-    throw error;
-  }
-}
-
-async function classifyWithFallback({ name, url, body, requestId, fallbackFactory, normalizer }) {
-  try {
-    const { result, attempts } = await callModelWithRetry(url, body, requestId);
-
-    return {
-      data: normalizer(result),
-      meta: {
-        status: "ok",
-        attempts,
-        errorType: null,
-        errorMessage: null,
-        source: "remote"
-      }
-    };
-  } catch (error) {
-    const errorType = classifyError(error);
-    const baseMeta = {
-      attempts: Number(error?.attempts ?? error?.attemptNumber ?? MODEL_RETRIES + 1),
-      errorType,
-      errorMessage: (error?.originalError?.message ?? error?.message) || `${name} classification failed`
-    };
-
-    try {
-      const fallback = fallbackFactory();
-
-      return {
-        data: fallback,
-        meta: {
-          status: "fallback_used",
-          ...baseMeta,
-          source: "fallback"
-        }
-      };
-    } catch {
-      return {
-        data: null,
-        meta: {
-          status: "failed",
-          ...baseMeta,
-          source: "fallback"
-        }
-      };
-    }
-  }
-}
-
 function containsToxicLabel(label) {
   const normalized = String(label ?? "").toLowerCase();
   return (
@@ -232,38 +63,6 @@ function containsToxicLabel(label) {
     normalized.includes("threat") ||
     normalized.includes("obscene")
   );
-}
-
-function shouldReviewFromToxicity(toxicityResult, toxicityMeta) {
-  if (toxicityMeta.source !== "remote" || toxicityMeta.status !== "ok") {
-    return true;
-  }
-
-  if (!Array.isArray(toxicityResult)) {
-    return true;
-  }
-
-  return toxicityResult.some(item => {
-    const score = Number(item?.score ?? 0);
-    return score >= TOXICITY_REVIEW_THRESHOLD && containsToxicLabel(item?.label);
-  });
-}
-
-function resolvePostStatus(toxicityResult, toxicityMeta) {
-  if (toxicityMeta.status === "failed") {
-    return POST_STATUS.CLASSIFICATION_FAILED;
-  }
-
-  if (shouldReviewFromToxicity(toxicityResult, toxicityMeta)) {
-    return POST_STATUS.REVIEW_REQUIRED;
-  }
-
-  return POST_STATUS.PUBLISHED;
-}
-
-function hasManyClassificationFailures(meta) {
-  const failedCount = Object.values(meta).filter(item => item?.status === "failed").length;
-  return failedCount >= 2;
 }
 
 function getHighestToxicityLabel(toxicityResult) {
@@ -282,41 +81,81 @@ function getHighestToxicityLabel(toxicityResult) {
   }, null);
 }
 
-function getStatusDecision({ sentiment, toxicity, zeroshot }) {
-  if (hasManyClassificationFailures({ sentiment: sentiment.meta, toxicity: toxicity.meta, zeroshot: zeroshot.meta })) {
+function getSpamScore(zeroshotResult) {
+  const labels = Array.isArray(zeroshotResult?.labels) ? zeroshotResult.labels : [];
+  const scores = Array.isArray(zeroshotResult?.scores) ? zeroshotResult.scores : [];
+  const spamIndex = labels.findIndex(label => String(label).toLowerCase() === "spam");
+  if (spamIndex < 0) {
+    return null;
+  }
+
+  return Number(scores[spamIndex] ?? 0);
+}
+
+function getClassificationFailures(post) {
+  const failed = Array.isArray(post.failedClassifiers) ? post.failedClassifiers : [];
+  return new Set(failed);
+}
+
+function getClassificationCompleted(post) {
+  const completed = Array.isArray(post.completedClassifiers) ? post.completedClassifiers : [];
+  return new Set(completed);
+}
+
+function allClassifiersSettled(post) {
+  const requested = Array.isArray(post.requestedClassifiers) && post.requestedClassifiers.length
+    ? post.requestedClassifiers
+    : [...REQUESTED_CLASSIFIERS];
+
+  const completed = getClassificationCompleted(post);
+  const failed = getClassificationFailures(post);
+
+  return requested.every(classifier => completed.has(classifier) || failed.has(classifier));
+}
+
+function resolveFinalDecision(post) {
+  const failed = getClassificationFailures(post);
+  const toxicityMeta = post.classificationMeta?.toxicity ?? null;
+  const toxicityFailed = failed.has("toxicity") || toxicityMeta?.status === "failed";
+
+  if (failed.size >= 2) {
     return {
       status: POST_STATUS.CLASSIFICATION_FAILED,
-      statusReason: "Multiple classifiers failed; moderation decision is technically unsafe."
+      statusReason: "Multiple classifiers failed; decision is technically unsafe."
     };
   }
 
-  if (toxicity.meta.status === "failed") {
-    return {
-      status: POST_STATUS.CLASSIFICATION_FAILED,
-      statusReason: "Toxicity classifier failed without a reliable decision fallback."
-    };
-  }
-
-  if (toxicity.meta.source !== "remote" || toxicity.meta.status !== "ok") {
+  if (toxicityFailed) {
     return {
       status: POST_STATUS.REVIEW_REQUIRED,
-      statusReason: "Toxicity used fallback data; manual review required."
+      statusReason: "Toxicity failed; manual review required."
     };
   }
 
-  const highestToxicity = getHighestToxicityLabel(toxicity.data);
-  if (highestToxicity && containsToxicLabel(highestToxicity.label) && highestToxicity.score >= TOXICITY_REVIEW_THRESHOLD) {
+  if (toxicityMeta?.status !== "ok") {
+    return {
+      status: POST_STATUS.REVIEW_REQUIRED,
+      statusReason: "Toxicity has no reliable positive result."
+    };
+  }
+
+  const highestToxicity = getHighestToxicityLabel(post.toxicity);
+  if (!highestToxicity) {
+    return {
+      status: POST_STATUS.REVIEW_REQUIRED,
+      statusReason: "Missing toxicity score; manual review required."
+    };
+  }
+
+  if (containsToxicLabel(highestToxicity.label) && highestToxicity.score >= TOXICITY_REVIEW_THRESHOLD) {
     return {
       status: POST_STATUS.REVIEW_REQUIRED,
       statusReason: `Toxicity risk detected (${highestToxicity.label}: ${highestToxicity.score.toFixed(2)}).`
     };
   }
 
-  const spamLabelIndex = Array.isArray(zeroshot.data?.labels)
-    ? zeroshot.data.labels.findIndex(label => String(label).toLowerCase() === "spam")
-    : -1;
-  const spamScore = spamLabelIndex >= 0 ? Number(zeroshot.data?.scores?.[spamLabelIndex] ?? 0) : 0;
-  if (spamScore >= SPAM_REVIEW_THRESHOLD) {
+  const spamScore = getSpamScore(post.zeroshot);
+  if (spamScore !== null && spamScore >= SPAM_REVIEW_THRESHOLD) {
     return {
       status: POST_STATUS.REVIEW_REQUIRED,
       statusReason: `High spam probability from zeroshot (${spamScore.toFixed(2)}).`
@@ -324,33 +163,29 @@ function getStatusDecision({ sentiment, toxicity, zeroshot }) {
   }
 
   return {
-    status: resolvePostStatus(toxicity.data, toxicity.meta),
+    status: POST_STATUS.PUBLISHED,
     statusReason: "Classification completed; post published."
   };
 }
 
-async function createPendingPost({ authorUsername, authorProfile, text, classificationRunId }) {
-  const now = new Date();
-  const classifierMetaPending = {
+function classifierPendingMeta() {
+  return {
     status: "pending",
     attempts: 0,
     errorType: null,
     errorMessage: null,
-    source: "queue"
+    source: "queue",
+    messageId: null,
+    eventType: null,
+    modelVersion: null,
+    classifiedAt: null,
+    failedAt: null
   };
-  const pendingPost = {
-    author: authorUsername,
-    authorId: authorUsername,
-    authorSnapshot: {
-      username: authorProfile.username,
-      displayName: authorProfile.displayName,
-      role: authorProfile.role,
-      group: authorProfile.group
-    },
-    text,
-    status: POST_STATUS.PENDING_CLASSIFICATION,
-    statusReason: "Post stored; classification request queued.",
-    classificationRunId,
+}
+
+function resetClassificationFields(runId, now) {
+  return {
+    classificationRunId: runId,
     requestedClassifiers: [...REQUESTED_CLASSIFIERS],
     completedClassifiers: [],
     failedClassifiers: [],
@@ -359,69 +194,24 @@ async function createPendingPost({ authorUsername, authorProfile, text, classifi
     sentiment: null,
     toxicity: null,
     zeroshot: null,
+    status: POST_STATUS.PENDING_CLASSIFICATION,
+    statusReason: "Post stored; classification request queued.",
     classificationMeta: {
-      sentiment: { ...classifierMetaPending },
-      toxicity: { ...classifierMetaPending },
-      zeroshot: { ...classifierMetaPending }
+      sentiment: classifierPendingMeta(),
+      toxicity: classifierPendingMeta(),
+      zeroshot: classifierPendingMeta()
     },
-    createdAt: now,
     updatedAt: now
   };
-
-  const result = await postsCollection.insertOne(pendingPost);
-  return { insertedId: result.insertedId };
 }
 
-async function enrichText(text, requestId) {
-  const [sentiment, toxicity, zeroshot] = await Promise.all([
-    classifyWithFallback({
-      name: "sentiment",
-      url: SENTIMENT_URL,
-      body: { text },
-      requestId,
-      fallbackFactory: () => ({ label: "unknown", score: 0 }),
-      normalizer: response => response.result?.[0] ?? null
-    }),
-    classifyWithFallback({
-      name: "toxicity",
-      url: TOXICITY_URL,
-      body: { text },
-      requestId,
-      fallbackFactory: () => [],
-      normalizer: response => response.result ?? []
-    }),
-    classifyWithFallback({
-      name: "zeroshot",
-      url: ZEROSHOT_URL,
-      body: {
-        text,
-        candidate_labels: ZERO_SHOT_LABELS,
-        multi_label: ZERO_SHOT_MULTI_LABEL
-      },
-      requestId,
-      fallbackFactory: () => null,
-      normalizer: response => ({
-        sequence: response.sequence,
-        labels: response.labels ?? [],
-        scores: response.scores ?? []
-      })
-    })
-  ]);
+function isSameClassifierMessage(post, classifier, messageId) {
+  if (!classifier || !messageId) {
+    return false;
+  }
 
-  const decision = getStatusDecision({ sentiment, toxicity, zeroshot });
-
-  return {
-    sentiment: sentiment.data,
-    toxicity: toxicity.data,
-    zeroshot: zeroshot.data,
-    status: decision.status,
-    statusReason: decision.statusReason,
-    classificationMeta: {
-      sentiment: sentiment.meta,
-      toxicity: toxicity.meta,
-      zeroshot: zeroshot.meta
-    }
-  };
+  const existingMessageId = post?.classificationMeta?.[classifier]?.messageId;
+  return existingMessageId === messageId;
 }
 
 async function fetchAuthorProfile(username) {
@@ -435,6 +225,203 @@ async function fetchAuthorProfile(username) {
   return await response.json();
 }
 
+async function publishClassificationRequested({ postId, authorId, text, classificationRunId }) {
+  if (!rabbit?.channel) {
+    throw new Error("RabbitMQ channel unavailable");
+  }
+
+  const event = {
+    messageId: crypto.randomUUID(),
+    eventType: ROUTING_KEYS.REQUESTED,
+    classificationRunId,
+    postId: postId.toString(),
+    authorId,
+    text,
+    requestedClassifiers: [...REQUESTED_CLASSIFIERS],
+    createdAt: new Date().toISOString()
+  };
+
+  const published = publishJson(
+    rabbit.channel,
+    rabbit.exchangeName,
+    ROUTING_KEYS.REQUESTED,
+    event,
+    { messageId: event.messageId }
+  );
+
+  if (!published) {
+    throw new Error("RabbitMQ publish returned false");
+  }
+}
+
+function normalizeResultEvent(message, msg) {
+  const routingKey = msg?.fields?.routingKey ?? "";
+  const eventType = String(message?.eventType ?? routingKey ?? "");
+  const classifierFromType = eventType.split(".").at(-1);
+  const classifier = String(message?.classifier ?? classifierFromType ?? "").trim().toLowerCase();
+
+  if (!SUPPORTED_CLASSIFIERS.has(classifier)) {
+    throw new Error(`unsupported classifier '${classifier}'`);
+  }
+
+  const base = {
+    postId: String(message?.postId ?? ""),
+    classificationRunId: String(message?.classificationRunId ?? ""),
+    classifier,
+    messageId: String(message?.messageId ?? msg?.properties?.messageId ?? crypto.randomUUID()),
+    eventType,
+    routingKey
+  };
+
+  if (!base.postId || !base.classificationRunId) {
+    throw new Error("missing postId or classificationRunId");
+  }
+
+  return {
+    ...base,
+    isFailed: routingKey.startsWith("classification.failed."),
+    payloadStatus: String(message?.status ?? "").toLowerCase(),
+    result: message?.result,
+    errorType: message?.errorType ?? null,
+    errorMessage: message?.errorMessage ?? null,
+    modelVersion: message?.modelVersion ?? null,
+    classifiedAt: message?.classifiedAt ?? null,
+    failedAt: message?.failedAt ?? null
+  };
+}
+
+async function finalizeClassificationIfReady(postId, classificationRunId) {
+  const post = await postsCollection.findOne({ _id: postId });
+
+  if (!post) {
+    return;
+  }
+
+  if (post.classificationRunId !== classificationRunId) {
+    return;
+  }
+
+  if (!allClassifiersSettled(post)) {
+    return;
+  }
+
+  if (post.classificationCompletedAt) {
+    return;
+  }
+
+  const decision = resolveFinalDecision(post);
+  const now = new Date();
+
+  await postsCollection.updateOne(
+    { _id: postId, classificationRunId, classificationCompletedAt: null },
+    {
+      $set: {
+        classificationCompletedAt: now,
+        status: decision.status,
+        statusReason: decision.statusReason,
+        updatedAt: now
+      }
+    }
+  );
+}
+
+async function handleClassificationResult(message, msg) {
+  const event = normalizeResultEvent(message, msg);
+  const postId = new ObjectId(event.postId);
+  const now = new Date();
+  const classifierPath = `classificationMeta.${event.classifier}`;
+
+  const post = await postsCollection.findOne({ _id: postId });
+  if (!post) {
+    return;
+  }
+
+  if (post.classificationRunId !== event.classificationRunId) {
+    return;
+  }
+
+  if (isSameClassifierMessage(post, event.classifier, event.messageId)) {
+    return;
+  }
+
+  const completedSet = getClassificationCompleted(post);
+  const failedSet = getClassificationFailures(post);
+  if (completedSet.has(event.classifier) || failedSet.has(event.classifier)) {
+    return;
+  }
+
+  const isFailedEvent = event.isFailed || event.payloadStatus === "failed";
+
+  if (isFailedEvent) {
+    await postsCollection.updateOne(
+      { _id: postId, classificationRunId: event.classificationRunId },
+      {
+        $set: {
+          [classifierPath]: {
+            status: "failed",
+            attempts: 1,
+            errorType: event.errorType ?? "processing_error",
+            errorMessage: event.errorMessage ?? "classifier failed",
+            source: "queue",
+            messageId: event.messageId,
+            eventType: event.eventType,
+            modelVersion: event.modelVersion,
+            classifiedAt: event.classifiedAt,
+            failedAt: event.failedAt ?? now.toISOString()
+          },
+          updatedAt: now
+        },
+        $addToSet: { failedClassifiers: event.classifier }
+      }
+    );
+  } else {
+    await postsCollection.updateOne(
+      { _id: postId, classificationRunId: event.classificationRunId },
+      {
+        $set: {
+          [event.classifier]: event.result ?? null,
+          [classifierPath]: {
+            status: "ok",
+            attempts: 1,
+            errorType: null,
+            errorMessage: null,
+            source: "queue",
+            messageId: event.messageId,
+            eventType: event.eventType,
+            modelVersion: event.modelVersion,
+            classifiedAt: event.classifiedAt ?? now.toISOString(),
+            failedAt: null
+          },
+          updatedAt: now
+        },
+        $addToSet: { completedClassifiers: event.classifier }
+      }
+    );
+  }
+
+  await finalizeClassificationIfReady(postId, event.classificationRunId);
+}
+
+async function startResultsConsumer() {
+  if (!rabbit?.channel) {
+    console.warn("[rabbit] posts result consumer disabled - channel unavailable");
+    return;
+  }
+
+  await rabbit.channel.prefetch(CONSUMER_PREFETCH);
+  await consumeJson(rabbit.channel, QUEUES.POSTS_RESULTS, handleClassificationResult);
+  console.log(`[rabbit] consuming ${QUEUES.POSTS_RESULTS}`);
+}
+
+app.get("/health", async (req, res) => {
+  try {
+    await db.command({ ping: 1 });
+    res.json({ status: "ok" });
+  } catch {
+    res.status(500).json({ status: "error" });
+  }
+});
+
 app.post("/posts", authMiddleware, async (req, res) => {
   try {
     const { text } = req.body ?? {};
@@ -446,62 +433,49 @@ app.post("/posts", authMiddleware, async (req, res) => {
     const normalizedText = text.trim();
     const classificationRunId = crypto.randomUUID();
     const authorProfile = await fetchAuthorProfile(req.user.username);
-    const { insertedId } = await createPendingPost({
-      authorUsername: req.user.username,
-      authorProfile,
+    const now = new Date();
+
+    const pendingPost = {
+      author: req.user.username,
+      authorId: req.user.username,
+      authorSnapshot: {
+        username: authorProfile.username,
+        displayName: authorProfile.displayName,
+        role: authorProfile.role,
+        group: authorProfile.group
+      },
       text: normalizedText,
-      classificationRunId
-    });
+      createdAt: now,
+      ...resetClassificationFields(classificationRunId, now)
+    };
+
+    const inserted = await postsCollection.insertOne(pendingPost);
 
     try {
-      const event = {
-        messageId: crypto.randomUUID(),
-        eventType: ROUTING_KEYS.REQUESTED,
-        classificationRunId,
-        postId: insertedId.toString(),
+      await publishClassificationRequested({
+        postId: inserted.insertedId,
         authorId: req.user.username,
         text: normalizedText,
-        requestedClassifiers: [...REQUESTED_CLASSIFIERS],
-        createdAt: new Date().toISOString()
-      };
+        classificationRunId
+      });
 
-      if (!rabbit?.channel) {
-        throw new Error("RabbitMQ channel unavailable");
-      }
-
-      const published = publishJson(
-        rabbit.channel,
-        rabbit.exchangeName,
-        ROUTING_KEYS.REQUESTED,
-        event,
-        { messageId: event.messageId }
-      );
-
-      if (!published) {
-        throw new Error("RabbitMQ publish returned false");
-      }
-
-      const createdPost = await postsCollection.findOne({ _id: insertedId });
-      return res.status(202).json({ id: insertedId, ...createdPost });
+      const createdPost = await postsCollection.findOne({ _id: inserted.insertedId });
+      return res.status(202).json({ id: inserted.insertedId, ...createdPost });
     } catch (publishError) {
-      const now = new Date();
+      const failNow = new Date();
       await postsCollection.updateOne(
-        { _id: insertedId },
+        { _id: inserted.insertedId },
         {
           $set: {
             status: POST_STATUS.CLASSIFICATION_FAILED,
             statusReason: `Failed to publish classification.requested: ${publishError?.message ?? "unknown error"}`,
-            classificationMeta: {
-              sentiment: { status: "pending", source: "queue", errorMessage: null },
-              toxicity: { status: "pending", source: "queue", errorMessage: null },
-              zeroshot: { status: "pending", source: "queue", errorMessage: null },
-              publication: {
-                status: "failed",
-                source: "rabbitmq",
-                errorMessage: publishError?.message ?? "unknown error"
-              }
-            },
-            updatedAt: now
+            updatedAt: failNow,
+            "classificationMeta.publication": {
+              status: "failed",
+              source: "rabbitmq",
+              errorMessage: publishError?.message ?? "unknown error",
+              at: failNow.toISOString()
+            }
           }
         }
       );
@@ -509,7 +483,7 @@ app.post("/posts", authMiddleware, async (req, res) => {
       return res.status(503).json({
         error: "classification dispatch failed",
         details: publishError?.message ?? "unknown error",
-        postId: insertedId
+        postId: inserted.insertedId
       });
     }
   } catch (err) {
@@ -518,9 +492,76 @@ app.post("/posts", authMiddleware, async (req, res) => {
       return res.status(503).json({ error: "users service unavailable" });
     }
 
-    res.status(500).json({ error: "internal error" });
+    return res.status(500).json({ error: "internal error" });
   }
 });
+
+app.post("/admin/classification/backfill", async (req, res) => {
+  try {
+    const filter = {
+      $or: [
+        { classificationRunId: { $exists: false } },
+        { status: POST_STATUS.CLASSIFICATION_FAILED },
+        {
+          status: POST_STATUS.PENDING_CLASSIFICATION,
+          $expr: {
+            $lt: [
+              { $add: [{ $size: { $ifNull: ["$completedClassifiers", []] } }, { $size: { $ifNull: ["$failedClassifiers", []] } }] },
+              REQUESTED_CLASSIFIERS.length
+            ]
+          }
+        }
+      ]
+    };
+
+    const posts = await postsCollection.find(filter).limit(200).toArray();
+    let published = 0;
+
+    for (const post of posts) {
+      const runId = crypto.randomUUID();
+      const now = new Date();
+
+      await postsCollection.updateOne(
+        { _id: post._id },
+        { $set: resetClassificationFields(runId, now) }
+      );
+
+      try {
+        await publishClassificationRequested({
+          postId: post._id,
+          authorId: post.authorId ?? post.author,
+          text: post.text,
+          classificationRunId: runId
+        });
+
+        published += 1;
+      } catch (error) {
+        await postsCollection.updateOne(
+          { _id: post._id },
+          {
+            $set: {
+              status: POST_STATUS.CLASSIFICATION_FAILED,
+              statusReason: `Backfill publish failed: ${error?.message ?? "unknown error"}`,
+              updatedAt: new Date(),
+              "classificationMeta.publication": {
+                status: "failed",
+                source: "rabbitmq",
+                errorMessage: error?.message ?? "unknown error",
+                at: new Date().toISOString()
+              }
+            }
+          }
+        );
+      }
+    }
+
+    return res.json({ matched: posts.length, published });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "internal error" });
+  }
+});
+
 app.get("/posts", async (req, res) => {
   try {
     const statusQuery = typeof req.query.status === "string" ? req.query.status.trim() : "";
@@ -541,14 +582,13 @@ app.get("/posts", async (req, res) => {
       .limit(100)
       .toArray();
 
-    res.json(posts);
+    return res.json(posts);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "internal error" });
+    return res.status(500).json({ error: "internal error" });
   }
 });
 
-// a method displays all posts, independently on the status
 app.get("/allposts", async (req, res) => {
   try {
     const posts = await postsCollection
@@ -557,10 +597,10 @@ app.get("/allposts", async (req, res) => {
       .limit(100)
       .toArray();
 
-    res.json(posts);
+    return res.json(posts);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "internal error" });
+    return res.status(500).json({ error: "internal error" });
   }
 });
 
@@ -572,14 +612,15 @@ app.get("/posts/me", authMiddleware, async (req, res) => {
       .limit(100)
       .toArray();
 
-    res.json(posts);
+    return res.json(posts);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "internal error" });
+    return res.status(500).json({ error: "internal error" });
   }
 });
 
 const rabbit = await bootstrapRabbitMQ();
+await startResultsConsumer();
 
 app.listen(PORT, () => {
   console.log(`posts service listening on port ${PORT}`);
