@@ -19,6 +19,10 @@ QUEUE_NAMES = {
 }
 
 
+def technical_dlq_routing_key(classifier_name):
+    return f"classification.dlq.{classifier_name}"
+
+
 class TransientProcessingError(Exception):
     pass
 
@@ -69,15 +73,28 @@ class RabbitClassifierConsumer:
                 channel = connection.channel()
                 channel.basic_qos(prefetch_count=1)
 
+                classifier_name = self.config.service_name
+                dead_letter_routing_key = technical_dlq_routing_key(classifier_name)
+
                 channel.exchange_declare(exchange=self.exchange, exchange_type="topic", durable=True)
-                channel.queue_declare(queue=self.queue_name, durable=True)
+                channel.queue_declare(
+                    queue=self.queue_name,
+                    durable=True,
+                    arguments={
+                        "x-dead-letter-exchange": self.exchange,
+                        "x-dead-letter-routing-key": dead_letter_routing_key,
+                    },
+                )
                 channel.queue_bind(queue=self.queue_name, exchange=self.exchange, routing_key=REQUEST_ROUTING_KEY)
 
                 logger.info(
-                    "rabbit_consumer_started service=%s queue=%s exchange=%s fail_mode=%s",
-                    self.config.service_name,
-                    self.queue_name,
+                    "rabbit_consumer_started service=%s exchange=%s queue=%s routing_key=%s dead_letter_exchange=%s dead_letter_routing_key=%s fail_mode=%s",
+                    classifier_name,
                     self.exchange,
+                    self.queue_name,
+                    REQUEST_ROUTING_KEY,
+                    self.exchange,
+                    dead_letter_routing_key,
                     self.fail_mode,
                 )
 
