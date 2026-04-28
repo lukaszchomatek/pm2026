@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request, HTTPException
 from app.core.config import build_config
 from app.core.middleware import add_request_id
 from app.core.model_loader import get_model
+from app.core.rabbit_consumer import RabbitClassifierConsumer
 
 logger = logging.getLogger("hf-inference-service")
 
@@ -28,7 +29,19 @@ def create_app(service_module) -> FastAPI:
             use_gpu=config.use_gpu,
             pipeline_kwargs=pipeline_kwargs,
         )
-        yield
+
+        consumer = RabbitClassifierConsumer(
+            config=config,
+            service_module=service_module,
+            model_getter=get_model,
+            pipeline_kwargs=pipeline_kwargs,
+        )
+        consumer.start()
+
+        try:
+            yield
+        finally:
+            consumer.stop()
 
     app = FastAPI(
         title=f"{config.service_name} service",
