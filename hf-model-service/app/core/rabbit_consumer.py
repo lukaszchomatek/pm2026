@@ -70,14 +70,7 @@ class RabbitClassifierConsumer:
                 channel.basic_qos(prefetch_count=1)
 
                 channel.exchange_declare(exchange=self.exchange, exchange_type="topic", durable=True)
-                channel.queue_declare(
-                    queue=self.queue_name,
-                    durable=True,
-                    arguments={
-                        "x-dead-letter-exchange": self.exchange,
-                        "x-dead-letter-routing-key": f"classification.failed.{self.config.service_name}",
-                    },
-                )
+                channel.queue_declare(queue=self.queue_name, durable=True)
                 channel.queue_bind(queue=self.queue_name, exchange=self.exchange, routing_key=REQUEST_ROUTING_KEY)
 
                 logger.info(
