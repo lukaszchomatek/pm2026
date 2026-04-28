@@ -3,6 +3,8 @@ import jwt from "jsonwebtoken";
 import { MongoClient } from "mongodb";
 import pRetry, { AbortError as PRetryAbortError } from "p-retry";
 import { bootstrapRabbitMQ } from "./messaging/bootstrapRabbitMQ.js";
+import { ROUTING_KEYS } from "./messaging/classificationTopology.js";
+import { publishJson } from "./messaging/rabbit.js";
 
 const app = express();
 app.use(express.json());
@@ -29,6 +31,7 @@ const POST_STATUS = Object.freeze({
   REVIEW_REQUIRED: "REVIEW_REQUIRED",
   CLASSIFICATION_FAILED: "CLASSIFICATION_FAILED"
 });
+const REQUESTED_CLASSIFIERS = Object.freeze(["sentiment", "toxicity", "zeroshot"]);
 
 function parseZeroShotLabels() {
   try {
@@ -326,8 +329,15 @@ function getStatusDecision({ sentiment, toxicity, zeroshot }) {
   };
 }
 
-async function createPendingPost({ authorUsername, authorProfile, text }) {
+async function createPendingPost({ authorUsername, authorProfile, text, classificationRunId }) {
   const now = new Date();
+  const classifierMetaPending = {
+    status: "pending",
+    attempts: 0,
+    errorType: null,
+    errorMessage: null,
+    source: "queue"
+  };
   const pendingPost = {
     author: authorUsername,
     authorId: authorUsername,
@@ -339,13 +349,21 @@ async function createPendingPost({ authorUsername, authorProfile, text }) {
     },
     text,
     status: POST_STATUS.PENDING_CLASSIFICATION,
-    statusReason: "Post stored; waiting for classifier responses.",
+    statusReason: "Post stored; classification request queued.",
+    classificationRunId,
+    requestedClassifiers: [...REQUESTED_CLASSIFIERS],
+    completedClassifiers: [],
+    failedClassifiers: [],
     classificationStartedAt: now,
     classificationCompletedAt: null,
     sentiment: null,
     toxicity: null,
     zeroshot: null,
-    classificationMeta: null,
+    classificationMeta: {
+      sentiment: { ...classifierMetaPending },
+      toxicity: { ...classifierMetaPending },
+      zeroshot: { ...classifierMetaPending }
+    },
     createdAt: now,
     updatedAt: now
   };
@@ -426,53 +444,74 @@ app.post("/posts", authMiddleware, async (req, res) => {
     }
 
     const normalizedText = text.trim();
-    const requestId = crypto.randomUUID();
+    const classificationRunId = crypto.randomUUID();
     const authorProfile = await fetchAuthorProfile(req.user.username);
     const { insertedId } = await createPendingPost({
       authorUsername: req.user.username,
       authorProfile,
-      text: normalizedText
+      text: normalizedText,
+      classificationRunId
     });
 
-    let enrichment;
-
     try {
-      enrichment = await enrichText(normalizedText, requestId);
-    } catch (classificationError) {
-      console.error(classificationError);
-      enrichment = {
-        sentiment: null,
-        toxicity: null,
-        zeroshot: null,
-        status: POST_STATUS.CLASSIFICATION_FAILED,
-        statusReason: "Unexpected classification pipeline failure.",
-        classificationMeta: {
-          sentiment: { status: "failed", source: "pipeline", errorMessage: classificationError?.message ?? "unknown error" },
-          toxicity: { status: "failed", source: "pipeline", errorMessage: classificationError?.message ?? "unknown error" },
-          zeroshot: { status: "failed", source: "pipeline", errorMessage: classificationError?.message ?? "unknown error" }
-        }
+      const event = {
+        messageId: crypto.randomUUID(),
+        eventType: ROUTING_KEYS.REQUESTED,
+        classificationRunId,
+        postId: insertedId.toString(),
+        authorId: req.user.username,
+        text: normalizedText,
+        requestedClassifiers: [...REQUESTED_CLASSIFIERS],
+        createdAt: new Date().toISOString()
       };
-    }
 
-    const completedAt = new Date();
-    await postsCollection.updateOne(
-      { _id: insertedId },
-      {
-        $set: {
-          sentiment: enrichment.sentiment,
-          toxicity: enrichment.toxicity,
-          zeroshot: enrichment.zeroshot,
-          status: enrichment.status,
-          statusReason: enrichment.statusReason,
-          classificationMeta: enrichment.classificationMeta,
-          classificationCompletedAt: completedAt,
-          updatedAt: completedAt
-        }
+      if (!rabbit?.channel) {
+        throw new Error("RabbitMQ channel unavailable");
       }
-    );
 
-    const finalPost = await postsCollection.findOne({ _id: insertedId });
-    res.status(201).json({ id: insertedId, ...finalPost });
+      const published = publishJson(
+        rabbit.channel,
+        rabbit.exchangeName,
+        ROUTING_KEYS.REQUESTED,
+        event,
+        { messageId: event.messageId }
+      );
+
+      if (!published) {
+        throw new Error("RabbitMQ publish returned false");
+      }
+
+      const createdPost = await postsCollection.findOne({ _id: insertedId });
+      return res.status(202).json({ id: insertedId, ...createdPost });
+    } catch (publishError) {
+      const now = new Date();
+      await postsCollection.updateOne(
+        { _id: insertedId },
+        {
+          $set: {
+            status: POST_STATUS.CLASSIFICATION_FAILED,
+            statusReason: `Failed to publish classification.requested: ${publishError?.message ?? "unknown error"}`,
+            classificationMeta: {
+              sentiment: { status: "pending", source: "queue", errorMessage: null },
+              toxicity: { status: "pending", source: "queue", errorMessage: null },
+              zeroshot: { status: "pending", source: "queue", errorMessage: null },
+              publication: {
+                status: "failed",
+                source: "rabbitmq",
+                errorMessage: publishError?.message ?? "unknown error"
+              }
+            },
+            updatedAt: now
+          }
+        }
+      );
+
+      return res.status(503).json({
+        error: "classification dispatch failed",
+        details: publishError?.message ?? "unknown error",
+        postId: insertedId
+      });
+    }
   } catch (err) {
     console.error(err);
     if (err?.message?.includes("users service profile fetch failed")) {
@@ -540,7 +579,7 @@ app.get("/posts/me", authMiddleware, async (req, res) => {
   }
 });
 
-await bootstrapRabbitMQ();
+const rabbit = await bootstrapRabbitMQ();
 
 app.listen(PORT, () => {
   console.log(`posts service listening on port ${PORT}`);
