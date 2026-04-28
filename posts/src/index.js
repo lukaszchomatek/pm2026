@@ -2,6 +2,7 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { MongoClient } from "mongodb";
 import pRetry, { AbortError as PRetryAbortError } from "p-retry";
+import { bootstrapRabbitMQ } from "./messaging/bootstrapRabbitMQ.js";
 
 const app = express();
 app.use(express.json());
@@ -538,6 +539,8 @@ app.get("/posts/me", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "internal error" });
   }
 });
+
+await bootstrapRabbitMQ();
 
 app.listen(PORT, () => {
   console.log(`posts service listening on port ${PORT}`);
