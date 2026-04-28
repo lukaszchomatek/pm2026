@@ -49,9 +49,7 @@ export async function setupClassificationTopology(channel, exchangeName) {
     await setupClassifierQueue(channel, exchangeName, queueName, classifierName);
   }
 
-  await assertQueue(channel, QUEUES.POSTS_RESULTS, { durable: true });
-  await bindQueue(channel, QUEUES.POSTS_RESULTS, exchangeName, ROUTING_KEYS.RESULT_ALL);
-  await bindQueue(channel, QUEUES.POSTS_RESULTS, exchangeName, ROUTING_KEYS.FAILED_ALL);
+  await setupPostsResultsQueue(channel, exchangeName);
 }
 
 async function setupClassifierQueue(channel, exchangeName, queueName, classifierName) {
@@ -65,4 +63,20 @@ async function setupClassifierQueue(channel, exchangeName, queueName, classifier
   });
 
   await bindQueue(channel, queueName, exchangeName, ROUTING_KEYS.REQUESTED);
+}
+
+const POSTS_RESULTS_DLQ_ROUTING_KEY = technicalDlqRoutingKey("posts.results");
+
+async function setupPostsResultsQueue(channel, exchangeName) {
+  await assertQueue(channel, dlqName(QUEUES.POSTS_RESULTS), { durable: true });
+  await bindQueue(channel, dlqName(QUEUES.POSTS_RESULTS), exchangeName, POSTS_RESULTS_DLQ_ROUTING_KEY);
+
+  await assertQueue(channel, QUEUES.POSTS_RESULTS, {
+    durable: true,
+    deadLetterExchange: exchangeName,
+    deadLetterRoutingKey: POSTS_RESULTS_DLQ_ROUTING_KEY
+  });
+
+  await bindQueue(channel, QUEUES.POSTS_RESULTS, exchangeName, ROUTING_KEYS.RESULT_ALL);
+  await bindQueue(channel, QUEUES.POSTS_RESULTS, exchangeName, ROUTING_KEYS.FAILED_ALL);
 }

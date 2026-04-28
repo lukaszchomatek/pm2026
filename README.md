@@ -16,11 +16,10 @@ Prosta aplikacja demonstracyjna uruchamiana przez Docker Compose. Składa się z
 - Zalogowany użytkownik wysyła żądanie do `posts`, aby opublikować post.
 - Usługa `posts` weryfikuje token JWT.
 - Usługa `posts` pobiera profil autora z `users` i zapisuje jego snapshot razem z postem.
-- Usługa `posts` wysyła synchroniczne żądanie HTTP do `sentiment`.
-- Usługa `sentiment` analizuje tekst i zwraca wynik sentymentu.
-- Usługa `toxicity` sprawdza guardrails'y platformy (post jest publikowany tak czy tak)
-- Usługa `zeroshot` automatycznie nadaje kategorię postowi (i podaje poziomy dopasowania)
-- Usługa `posts` zapisuje post razem z wynikiem sentymentu w MongoDB.
+- Usługa `posts` zapisuje post jako `PENDING_CLASSIFICATION` i publikuje `classification.requested` do RabbitMQ.
+- Klasyfikatory (`sentiment`, `toxicity`, `zeroshot`) konsumują event i publikują `classification.result.<classifier>` albo `classification.failed.<classifier>`.
+- Usługa `posts` konsumuje wyniki przez `posts.classification.results`, aktualizuje dokument w MongoDB i ustala status końcowy (`PUBLISHED`, `REVIEW_REQUIRED`, `CLASSIFICATION_FAILED`).
+- `posts` pozostaje właścicielem danych: klasyfikatory nie zapisują bezpośrednio do MongoDB.
 
 ## Stos technologiczny
 
@@ -174,12 +173,22 @@ Przykładowe body:
 GET /posts
 ```
 
+Domyślnie endpoint zwraca tylko posty o statusie `PUBLISHED`.
+
 #### Lista własnych postów
 
 ```http
 GET /posts/me
 Authorization: Bearer <token>
 ```
+
+#### Backfill klasyfikacji (demo)
+
+```http
+POST /admin/classification/backfill
+```
+
+Uruchamia ponowną publikację `classification.requested` dla postów wymagających dogrania klasyfikacji.
 
 ---
 
@@ -246,6 +255,38 @@ curl -X POST "http://localhost:3002/posts" \
 ```bash
 curl -X GET "http://localhost:3002/posts"
 ```
+
+### 5. Backfill klasyfikacji (opcjonalnie)
+
+```bash
+curl -X POST "http://localhost:3002/admin/classification/backfill"
+```
+
+Przykładowa odpowiedź:
+
+```json
+{
+  "matched": 10,
+  "published": 10
+}
+```
+
+## RabbitMQ: DLQ (demo)
+
+Topologia klasyfikacji tworzy kolejki główne i `.dlq`:
+
+- `sentiment.classification.requests` + `sentiment.classification.requests.dlq`
+- `toxicity.classification.requests` + `toxicity.classification.requests.dlq`
+- `zeroshot.classification.requests` + `zeroshot.classification.requests.dlq`
+- `posts.classification.results` + `posts.classification.results.dlq`
+
+Wszystkie DLQ są podpięte do exchange `classification` przez routing key `classification.dlq.*`.
+
+### Jak wymusić błąd i zobaczyć wiadomość w DLQ wyników
+
+1. Opublikuj ręcznie uszkodzony JSON do kolejki wyników (albo event bez `postId` / `classificationRunId`).
+2. Consumer `posts` odrzuci (`nack requeue=false`) wiadomość.
+3. RabbitMQ przeniesie wiadomość do `posts.classification.results.dlq`.
 
 ## Przykładowe skrypty
 
