@@ -107,6 +107,15 @@ class RabbitClassifierConsumer:
                     self._handle_delivery(channel, method.delivery_tag, body, properties)
 
                 backoff_seconds = 1
+            except pika.exceptions.AMQPConnectionError as exc:
+                logger.warning(
+                    "rabbit_consumer_connection_retry service=%s backoff=%ss error=%s",
+                    self.config.service_name,
+                    backoff_seconds,
+                    str(exc) or exc.__class__.__name__,
+                )
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, 10)
             except Exception:
                 logger.exception("rabbit_consumer_connection_error service=%s", self.config.service_name)
                 time.sleep(backoff_seconds)
