@@ -125,6 +125,7 @@ services:
       MODEL_ID: cardiffnlp/twitter-roberta-base-sentiment-latest
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
+      FAIL_MODE: none
 
   toxicity:
     <<: *hf-service
@@ -143,6 +144,7 @@ services:
       MODEL_ID: unitary/toxic-bert
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
+      FAIL_MODE: none
 
   zeroshot:
     <<: *hf-service
@@ -161,6 +163,7 @@ services:
       MODEL_ID: facebook/bart-large-mnli
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
+      FAIL_MODE: none
 volumes:
   mongo_data:
   hf_cache:
