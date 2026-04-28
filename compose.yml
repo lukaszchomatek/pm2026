@@ -59,6 +59,12 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   users:
     build: ./users
@@ -100,13 +106,13 @@ services:
       zeroshot:
         condition: service_healthy
       rabbitmq:
-        condition: service_started
+        condition: service_healthy
 
   sentiment:
     <<: *hf-service
     depends_on:
       rabbitmq:
-        condition: service_started
+        condition: service_healthy
     container_name: sentiment
     ports:
       - "8000:8000"
@@ -124,7 +130,7 @@ services:
     <<: *hf-service
     depends_on:
       rabbitmq:
-        condition: service_started
+        condition: service_healthy
     container_name: toxicity
     ports:
       - "8001:8000"
@@ -142,7 +148,7 @@ services:
     <<: *hf-service
     depends_on:
       rabbitmq:
-        condition: service_started
+        condition: service_healthy
     container_name: zeroshot
     ports:
       - "8002:8000"
