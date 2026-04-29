@@ -1,8 +1,8 @@
-#!/usr/bin/env sh
+body=$(jq -n '{
+  username: "lukas2",
+  password: "haslohaslo"
+}')
 
 curl -X POST "http://localhost:3001/register" \
   -H "Content-Type: application/json" \
-  -d '{
-    "username": "user1",
-    "password": "tajnehaslo"
-  }'
+  -d "$body"

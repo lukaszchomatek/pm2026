@@ -1,0 +1,1 @@
+curl -s -X GET "http://localhost:3002/allposts" | jq

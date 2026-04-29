@@ -1,17 +1,17 @@
-#!/usr/bin/env sh
+# logowanie
+login_response=$(curl -s -X POST "http://localhost:3001/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"lukas2","password":"haslohaslo"}')
 
-TOKEN=$(
-  curl -s -X POST "http://localhost:3001/login" \
-    -H "Content-Type: application/json" \
-    -d '{
-      "username": "user1",
-      "password": "tajnehaslo"
-    }' | jq -r '.token'
-)
+token=$(echo "$login_response" | jq -r '.token')
+echo "$token"
+
+# utworzenie posta
+body=$(jq -n '{
+  text: "Docker is sooooooo good!"
+}')
 
 curl -X POST "http://localhost:3002/posts" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "text": "Microservices are awesome."
-  }'
+  -H "Authorization: Bearer $token" \
+  -d "$body"

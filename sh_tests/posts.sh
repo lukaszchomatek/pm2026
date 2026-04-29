@@ -1,3 +1,1 @@
-#!/usr/bin/env sh
-
-curl -X GET "http://localhost:3002/posts"
+curl -s -X GET "http://localhost:3002/posts" | jq
