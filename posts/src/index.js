@@ -579,7 +579,7 @@ app.get("/posts", async (req, res) => {
     const posts = await postsCollection
       .find({ status: statusFilter })
       .sort({ createdAt: -1 })
-      .limit(100)
+      .limit(5)
       .toArray();
 
     return res.json(posts);
