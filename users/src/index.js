@@ -2,9 +2,12 @@ import express from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { createClient } from "redis";
+import { logger, errorFields } from "./logger.js";
+import { requestContextMiddleware } from "./requestContext.js";
 
 const app = express();
 app.use(express.json());
+app.use(requestContextMiddleware);
 
 const PORT = process.env.PORT || 3001;
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
@@ -13,7 +16,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 const redis = createClient({ url: REDIS_URL });
 
 redis.on("error", (err) => {
-  console.error("Redis error:", err);
+  logger.error({ event: "redis_error", ...errorFields(err) }, "Redis error")
 });
 
 await redis.connect();
@@ -67,7 +70,7 @@ app.post("/register", async (req, res) => {
 
     res.status(201).json({ message: "user registered" });
   } catch (err) {
-    console.error(err);
+    logger.error({ event: "profile_fetch_failed", requestId: req.requestId, correlationId: req.correlationId, ...errorFields(err) }, "profile fetch failed");
     res.status(500).json({ error: "internal error" });
   }
 });
@@ -91,7 +94,7 @@ app.get("/users/:username/profile", async (req, res) => {
       group: user.group ?? "default"
     });
   } catch (err) {
-    console.error(err);
+    logger.error({ event: "login_failed", requestId: req.requestId, correlationId: req.correlationId, ...errorFields(err) }, "login failed");
     res.status(500).json({ error: "internal error" });
   }
 });
@@ -126,11 +129,11 @@ app.post("/login", async (req, res) => {
 
     res.json({ token });
   } catch (err) {
-    console.error(err);
+    logger.error({ event: "register_failed", requestId: req.requestId, correlationId: req.correlationId, ...errorFields(err) }, "register failed");
     res.status(500).json({ error: "internal error" });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`users service listening on port ${PORT}`);
+  logger.info({ event: "service_started", port: PORT }, "users service listening");
 });

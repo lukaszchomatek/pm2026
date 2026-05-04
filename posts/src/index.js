@@ -4,9 +4,12 @@ import { ObjectId, MongoClient } from "mongodb";
 import { bootstrapRabbitMQ } from "./messaging/bootstrapRabbitMQ.js";
 import { QUEUES, ROUTING_KEYS } from "./messaging/classificationTopology.js";
 import { consumeJson, publishJson } from "./messaging/rabbit.js";
+import { logger, errorFields } from "./logger.js";
+import { requestContextMiddleware } from "./requestContext.js";
 
 const app = express();
 app.use(express.json());
+app.use(requestContextMiddleware);
 
 const PORT = process.env.PORT || 3002;
 const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/postsdb";
@@ -225,14 +228,17 @@ async function fetchAuthorProfile(username) {
   return await response.json();
 }
 
-async function publishClassificationRequested({ postId, authorId, text, classificationRunId }) {
+async function publishClassificationRequested({ postId, authorId, text, classificationRunId, correlationId, causationId }) {
   if (!rabbit?.channel) {
     throw new Error("RabbitMQ channel unavailable");
   }
 
   const event = {
     messageId: crypto.randomUUID(),
+    type: ROUTING_KEYS.REQUESTED,
     eventType: ROUTING_KEYS.REQUESTED,
+    correlationId,
+    causationId,
     classificationRunId,
     postId: postId.toString(),
     authorId,
@@ -246,12 +252,14 @@ async function publishClassificationRequested({ postId, authorId, text, classifi
     rabbit.exchangeName,
     ROUTING_KEYS.REQUESTED,
     event,
-    { messageId: event.messageId }
+    { messageId: event.messageId, correlationId }
   );
 
   if (!published) {
     throw new Error("RabbitMQ publish returned false");
   }
+
+  logger.info({ event: "classification_requested_published", correlationId, postId: postId.toString(), messageId: event.messageId, causationId, status: POST_STATUS.PENDING_CLASSIFICATION });
 }
 
 function normalizeResultEvent(message, msg) {
@@ -270,7 +278,9 @@ function normalizeResultEvent(message, msg) {
     classifier,
     messageId: String(message?.messageId ?? msg?.properties?.messageId ?? crypto.randomUUID()),
     eventType,
-    routingKey
+    routingKey,
+    correlationId: String(message?.correlationId ?? msg?.properties?.correlationId ?? ""),
+    causationId: String(message?.causationId ?? "")
   };
 
   if (!base.postId || !base.classificationRunId) {
@@ -325,14 +335,24 @@ async function finalizeClassificationIfReady(postId, classificationRunId) {
   );
 }
 
-async function handleClassificationResult(message, msg) {
+async function handleClassificationResult(message, msg, parseError) {
+  if (parseError) {
+    logger.error({ event: "message_processing_failed", queue: QUEUES.POSTS_RESULTS, ...errorFields(parseError) });
+    msg && rabbit?.channel?.nack(msg, false, false);
+    logger.info({ event: "message_nack", queue: QUEUES.POSTS_RESULTS });
+    return;
+  }
+
   const event = normalizeResultEvent(message, msg);
+  logger.info({ event: "classification_result_consumed", correlationId: event.correlationId, postId: event.postId, classifierName: event.classifier, messageId: event.messageId, causationId: event.causationId });
   const postId = new ObjectId(event.postId);
   const now = new Date();
   const classifierPath = `classificationMeta.${event.classifier}`;
 
   const post = await postsCollection.findOne({ _id: postId });
   if (!post) {
+    msg && rabbit?.channel?.ack(msg);
+    logger.info({ event: "message_ack", postId: event.postId, messageId: event.messageId, correlationId: event.correlationId });
     return;
   }
 
@@ -374,6 +394,7 @@ async function handleClassificationResult(message, msg) {
         $addToSet: { failedClassifiers: event.classifier }
       }
     );
+    logger.info({ event: "partial_classification_saved", correlationId: event.correlationId, postId: event.postId, classifierName: event.classifier, status: "failed", messageId: event.messageId });
   } else {
     await postsCollection.updateOne(
       { _id: postId, classificationRunId: event.classificationRunId },
@@ -397,9 +418,13 @@ async function handleClassificationResult(message, msg) {
         $addToSet: { completedClassifiers: event.classifier }
       }
     );
+    logger.info({ event: "partial_classification_saved", correlationId: event.correlationId, postId: event.postId, classifierName: event.classifier, status: "ok", messageId: event.messageId });
   }
 
   await finalizeClassificationIfReady(postId, event.classificationRunId);
+  logger.info({ event: "post_status_updated", correlationId: event.correlationId, postId: event.postId });
+  msg && rabbit?.channel?.ack(msg);
+  logger.info({ event: "message_ack", correlationId: event.correlationId, postId: event.postId, messageId: event.messageId });
 }
 
 async function startResultsConsumer() {
@@ -425,6 +450,7 @@ app.get("/health", async (req, res) => {
 app.post("/posts", authMiddleware, async (req, res) => {
   try {
     const { text } = req.body ?? {};
+    logger.info({ event: "post_create_requested", requestId: req.requestId, correlationId: req.correlationId });
 
     if (!text || !text.trim()) {
       return res.status(400).json({ error: "text is required" });
@@ -433,6 +459,7 @@ app.post("/posts", authMiddleware, async (req, res) => {
     const normalizedText = text.trim();
     const classificationRunId = crypto.randomUUID();
     const authorProfile = await fetchAuthorProfile(req.user.username);
+    logger.info({ event: "author_snapshot_loaded", requestId: req.requestId, correlationId: req.correlationId, authorId: req.user.username });
     const now = new Date();
 
     const pendingPost = {
@@ -450,13 +477,16 @@ app.post("/posts", authMiddleware, async (req, res) => {
     };
 
     const inserted = await postsCollection.insertOne(pendingPost);
+    logger.info({ event: "post_saved_pending", requestId: req.requestId, correlationId: req.correlationId, postId: inserted.insertedId.toString(), status: POST_STATUS.PENDING_CLASSIFICATION });
 
     try {
       await publishClassificationRequested({
         postId: inserted.insertedId,
         authorId: req.user.username,
         text: normalizedText,
-        classificationRunId
+        classificationRunId,
+        correlationId: req.correlationId,
+        causationId: req.requestId
       });
 
       const createdPost = await postsCollection.findOne({ _id: inserted.insertedId });
@@ -487,7 +517,7 @@ app.post("/posts", authMiddleware, async (req, res) => {
       });
     }
   } catch (err) {
-    console.error(err);
+    logger.error({ event: "post_create_failed", requestId: req.requestId, correlationId: req.correlationId, ...errorFields(err) });
     if (err?.message?.includes("users service profile fetch failed")) {
       return res.status(503).json({ error: "users service unavailable" });
     }
@@ -557,7 +587,7 @@ app.post("/admin/classification/backfill", async (req, res) => {
 
     return res.json({ matched: posts.length, published });
   } catch (error) {
-    console.error(error);
+    logger.error({ event: "backfill_failed", ...errorFields(error) });
     return res.status(500).json({ error: "internal error" });
   }
 });
@@ -584,7 +614,7 @@ app.get("/posts", async (req, res) => {
 
     return res.json(posts);
   } catch (err) {
-    console.error(err);
+    logger.error({ event: "post_create_failed", requestId: req.requestId, correlationId: req.correlationId, ...errorFields(err) });
     return res.status(500).json({ error: "internal error" });
   }
 });
@@ -599,7 +629,7 @@ app.get("/allposts", async (req, res) => {
 
     return res.json(posts);
   } catch (err) {
-    console.error(err);
+    logger.error({ event: "post_create_failed", requestId: req.requestId, correlationId: req.correlationId, ...errorFields(err) });
     return res.status(500).json({ error: "internal error" });
   }
 });
@@ -614,7 +644,7 @@ app.get("/posts/me", authMiddleware, async (req, res) => {
 
     return res.json(posts);
   } catch (err) {
-    console.error(err);
+    logger.error({ event: "post_create_failed", requestId: req.requestId, correlationId: req.correlationId, ...errorFields(err) });
     return res.status(500).json({ error: "internal error" });
   }
 });

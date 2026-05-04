@@ -75,6 +75,7 @@ services:
       PORT: 3001
       REDIS_URL: redis://redis:6379
       JWT_SECRET: super-secret-jwt-key
+      LOG_LEVEL: info
     depends_on:
       - redis
 
@@ -96,6 +97,7 @@ services:
       MODEL_TIMEOUT_MS: 10000
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
+      LOG_LEVEL: info
     depends_on:
       mongo:
         condition: service_healthy
