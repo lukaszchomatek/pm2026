@@ -31,6 +31,12 @@ class PermanentProcessingError(Exception):
     pass
 
 
+def log_event(level, event, **fields):
+    payload = {"event": event, "service": os.getenv("SERVICE_KIND", "classifier"), **fields}
+    line = json.dumps(payload, default=str)
+    getattr(logger, level)(line)
+
+
 class RabbitClassifierConsumer:
     def __init__(self, *, config, service_module, model_getter, pipeline_kwargs):
         self.config = config
@@ -138,6 +144,7 @@ class RabbitClassifierConsumer:
         except Exception as exc:
             logger.warning("invalid_json service=%s error=%s", self.config.service_name, str(exc))
             channel.basic_ack(delivery_tag=delivery_tag)
+            log_event("info", "message_ack")
             return
 
         requested = event.get("requestedClassifiers")
@@ -147,7 +154,8 @@ class RabbitClassifierConsumer:
             return
 
         try:
-            result_payload = self._process_message(event)
+            log_event("info", "message_consumed", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"), textLength=len(event.get("text", "")))
+            result_payload = self._process_message(event, properties)
             routing_key = f"classification.result.{self.config.service_name}"
             self._publish(channel, routing_key, result_payload, properties)
             channel.basic_ack(delivery_tag=delivery_tag)
@@ -159,8 +167,9 @@ class RabbitClassifierConsumer:
                 str(exc),
             )
             channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+            log_event("info", "message_nack", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"))
         except Exception as exc:
-            failed_payload = self._build_failed_payload(event, exc)
+            failed_payload = self._build_failed_payload(event, exc, properties)
             routing_key = f"classification.failed.{self.config.service_name}"
             try:
                 self._publish(channel, routing_key, failed_payload, properties)
@@ -171,8 +180,9 @@ class RabbitClassifierConsumer:
 
             channel.basic_ack(delivery_tag=delivery_tag)
 
-    def _process_message(self, event):
+    def _process_message(self, event, properties):
         self._validate_event(event)
+        log_event("info", "classification_started", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"))
         self._apply_fail_mode()
 
         model = self.model_getter(
@@ -188,8 +198,11 @@ class RabbitClassifierConsumer:
 
         normalized_result = self._normalize_prediction(prediction)
 
-        return {
-            "messageId": event.get("messageId") or str(uuid.uuid4()),
+        out_message_id = str(uuid.uuid4())
+        payload = {
+            "messageId": out_message_id,
+            "causationId": event.get("messageId"),
+            "correlationId": event.get("correlationId") or getattr(properties, "correlation_id", None),
             "eventType": f"classification.result.{self.config.service_name}",
             "classificationRunId": event.get("classificationRunId"),
             "postId": event.get("postId"),
@@ -199,10 +212,15 @@ class RabbitClassifierConsumer:
             "modelVersion": "demo-v1",
             "classifiedAt": datetime.now(timezone.utc).isoformat(),
         }
+        log_event("info", "classification_completed", correlationId=payload.get("correlationId"), postId=event.get("postId"), messageId=out_message_id)
+        return payload
 
-    def _build_failed_payload(self, event, exc):
-        return {
-            "messageId": event.get("messageId") or str(uuid.uuid4()),
+    def _build_failed_payload(self, event, exc, properties):
+        out_message_id = str(uuid.uuid4())
+        payload = {
+            "messageId": out_message_id,
+            "causationId": event.get("messageId"),
+            "correlationId": event.get("correlationId") or getattr(properties, "correlation_id", None),
             "eventType": f"classification.failed.{self.config.service_name}",
             "classificationRunId": event.get("classificationRunId"),
             "postId": event.get("postId"),
@@ -212,6 +230,8 @@ class RabbitClassifierConsumer:
             "errorMessage": str(exc),
             "failedAt": datetime.now(timezone.utc).isoformat(),
         }
+        log_event("error", "classification_failed", correlationId=payload.get("correlationId"), postId=event.get("postId"), messageId=out_message_id, errorType=exc.__class__.__name__, errorMessage=str(exc))
+        return payload
 
     def _payload_for_classifier(self, event):
         payload = {"text": event.get("text", "")}
@@ -274,6 +294,7 @@ class RabbitClassifierConsumer:
     def _publish(self, channel, routing_key, payload, properties):
         message_id = payload.get("messageId") or str(uuid.uuid4())
         body = json.dumps(payload).encode("utf-8")
+        log_event("info", "classification_result_published", correlationId=payload.get("correlationId"), postId=payload.get("postId"), messageId=payload.get("messageId"), causationId=payload.get("causationId"))
         channel.basic_publish(
             exchange=self.exchange,
             routing_key=routing_key,

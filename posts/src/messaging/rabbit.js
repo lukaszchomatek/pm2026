@@ -48,10 +48,8 @@ export async function consumeJson(channel, queueName, handler, options = {}) {
       try {
         const parsed = JSON.parse(msg.content.toString("utf8"));
         await handler(parsed, msg);
-        channel.ack(msg);
       } catch (error) {
-        console.error(`[rabbit] failed to handle message from ${queueName}`, error);
-        channel.nack(msg, false, false);
+        await handler(null, msg, error);
       }
     },
     options
