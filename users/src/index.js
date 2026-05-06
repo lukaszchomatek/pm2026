@@ -4,10 +4,12 @@ import jwt from "jsonwebtoken";
 import { createClient } from "redis";
 import { logger, errorFields } from "./logger.js";
 import { requestContextMiddleware } from "./requestContext.js";
+import { metricsHandler, metricsMiddleware } from "./metrics.js";
 
 const app = express();
 app.use(express.json());
 app.use(requestContextMiddleware);
+app.use(metricsMiddleware);
 
 const PORT = process.env.PORT || 3001;
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
@@ -20,6 +22,8 @@ redis.on("error", (err) => {
 });
 
 await redis.connect();
+
+app.get("/metrics", metricsHandler);
 
 app.get("/health", async (req, res) => {
   try {

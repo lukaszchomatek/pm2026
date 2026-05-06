@@ -7,6 +7,7 @@ from app.core.config import build_config
 from app.core.middleware import add_request_id
 from app.core.model_loader import get_model
 from app.core.rabbit_consumer import RabbitClassifierConsumer
+from app.core.metrics import render_metrics
 
 logger = logging.getLogger("hf-inference-service")
 
@@ -97,6 +98,12 @@ def create_app(service_module) -> FastAPI:
     @app.get("/health")
     def health():
         return ready()
+
+    @app.get("/metrics")
+    def metrics():
+        payload, content_type = render_metrics()
+        from fastapi.responses import Response
+        return Response(content=payload, media_type=content_type)
 
     @app.post(config.endpoint_path, response_model=service_module.ResponseModel)
     def predict(payload: service_module.RequestModel, request: Request):

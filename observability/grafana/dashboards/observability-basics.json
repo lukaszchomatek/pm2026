@@ -1,0 +1,19 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {"type":"timeseries","title":"HTTP requests (posts)","gridPos":{"x":0,"y":0,"w":8,"h":7},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(rate(http_requests_total{service=\"posts\"}[1m])) by (route)","legendFormat":"{{route}}"}]},
+    {"type":"timeseries","title":"HTTP errors (posts)","gridPos":{"x":8,"y":0,"w":8,"h":7},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(rate(http_errors_total{service=\"posts\"}[1m])) by (status_code)","legendFormat":"{{status_code}}"}]},
+    {"type":"timeseries","title":"Posts per final status","gridPos":{"x":16,"y":0,"w":8,"h":7},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(increase(posts_status_total[5m])) by (status)","legendFormat":"{{status}}"}]},
+    {"type":"timeseries","title":"Classification results per classifier","gridPos":{"x":0,"y":7,"w":8,"h":7},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(increase(classification_results_total[5m])) by (classifier,status)","legendFormat":"{{classifier}}/{{status}}"}]},
+    {"type":"timeseries","title":"Classifier errors","gridPos":{"x":8,"y":7,"w":8,"h":7},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(rate(classifier_errors_total[1m])) by (classifier)","legendFormat":"{{classifier}}"}]},
+    {"type":"timeseries","title":"Fallbacks per classifier","gridPos":{"x":16,"y":7,"w":8,"h":7},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(increase(classification_fallbacks_total[5m])) by (classifier)","legendFormat":"{{classifier}}"}]},
+    {"type":"timeseries","title":"Classification duration p95 (posts)","gridPos":{"x":0,"y":14,"w":12,"h":7},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"histogram_quantile(0.95, sum(rate(classification_duration_seconds_bucket[5m])) by (le))","legendFormat":"p95"}]},
+    {"type":"timeseries","title":"RabbitMQ queue depth + unacked + ready","gridPos":{"x":12,"y":14,"w":12,"h":7},"datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(rabbitmq_queue_messages)","legendFormat":"messages"},{"expr":"sum(rabbitmq_queue_messages_ready)","legendFormat":"ready"},{"expr":"sum(rabbitmq_queue_messages_unacked)","legendFormat":"unacked"}]}
+  ],
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["observability","demo"],
+  "title": "PM2026 Observability Basics",
+  "version": 1
+}
