@@ -12,17 +12,24 @@ export function requestContextMiddleware(req, res, next) {
   res.setHeader("x-correlation-id", correlationId);
 
   logger.info({ event: "http_request_started", requestId, correlationId, method: req.method, path: req.path });
-  res.on("finish", () => {
+  res.on('finish', () => {
+    const durationMs = Date.now() - startedAt;
+
     const payload = {
-      event: res.statusCode >= 500 ? "http_request_failed" : "http_request_completed",
+      event: res.statusCode >= 500 ? 'http_request_failed' : 'http_request_completed',
       requestId,
       correlationId,
       method: req.method,
       path: req.path,
       statusCode: res.statusCode,
-      durationMs: Date.now() - startedAt
+      durationMs
     };
-    (res.statusCode >= 500 ? logger.error : logger.info)(payload);
+
+    if (res.statusCode >= 500) {
+      logger.error(payload, 'request finished');
+    } else {
+      logger.info(payload, 'request finished');
+    }
   });
   res.on("error", err => logger.error({ event: "http_request_failed", requestId, correlationId, ...errorFields(err) }));
   next();

@@ -180,12 +180,19 @@ services:
   alloy:
     image: grafana/alloy:v1.8.3
     container_name: alloy
-    command: ["run", "/etc/alloy/config.alloy"]
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "12345:12345"
     depends_on:
       - loki
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock.raw:/var/run/docker.sock:ro
       - ./observability/alloy-config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy/data
 
   grafana:
     image: grafana/grafana:11.1.4
@@ -206,3 +213,4 @@ volumes:
   hf_cache:
   loki_data:
   grafana_data:
+  alloy_data:

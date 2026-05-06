@@ -1,5 +1,5 @@
 logging {
-  level = "info"
+  level  = "info"
   format = "logfmt"
 }
 
@@ -12,27 +12,35 @@ discovery.relabel "containers" {
 
   rule {
     source_labels = ["__meta_docker_container_name"]
-    regex         = "/(.*)"
-    target_label  = "service"
+    regex         = "/(users|posts|sentiment|toxicity|zeroshot|rabbitmq)"
+    action        = "keep"
   }
 
   rule {
     source_labels = ["__meta_docker_container_name"]
-    regex         = "/(users|posts|sentiment|toxicity|zeroshot|rabbitmq)"
-    action        = "keep"
+    regex         = "/(.*)"
+    target_label  = "service"
   }
 }
 
 loki.source.docker "containers" {
   host             = "unix:///var/run/docker.sock"
   targets          = discovery.relabel.containers.output
-  forward_to       = [loki.process.json_logs.receiver]
-  relabel_rules    = discovery.relabel.containers.rules
+  forward_to       = [loki.process.container_logs.receiver]
   refresh_interval = "5s"
+
+  labels = {
+    job = "docker",
+  }
 }
 
-loki.process "json_logs" {
+loki.process "container_logs" {
   forward_to = [loki.write.default.receiver]
+
+  stage.drop {
+    older_than          = "1h"
+    drop_counter_reason = "too_old"
+  }
 
   stage.json {
     expressions = {
@@ -56,6 +64,7 @@ loki.write "default" {
   endpoint {
     url = "http://loki:3100/loki/api/v1/push"
   }
+
   external_labels = {
     environment = "local",
   }

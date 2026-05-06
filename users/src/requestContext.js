@@ -16,6 +16,7 @@ export function requestContextMiddleware(req, res, next) {
 
   res.on('finish', () => {
     const durationMs = Date.now() - startedAt;
+
     const payload = {
       event: res.statusCode >= 500 ? 'http_request_failed' : 'http_request_completed',
       requestId,
@@ -25,8 +26,12 @@ export function requestContextMiddleware(req, res, next) {
       statusCode: res.statusCode,
       durationMs
     };
-    const logFn = res.statusCode >= 500 ? logger.error : logger.info;
-    logFn(payload, 'request finished');
+
+    if (res.statusCode >= 500) {
+      logger.error(payload, 'request finished');
+    } else {
+      logger.info(payload, 'request finished');
+    }
   });
 
   res.on('error', (error) => {
