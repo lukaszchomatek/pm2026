@@ -1,0 +1,62 @@
+logging {
+  level = "info"
+  format = "logfmt"
+}
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(users|posts|sentiment|toxicity|zeroshot|rabbitmq)"
+    action        = "keep"
+  }
+}
+
+loki.source.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.containers.output
+  forward_to       = [loki.process.json_logs.receiver]
+  relabel_rules    = discovery.relabel.containers.rules
+  refresh_interval = "5s"
+}
+
+loki.process "json_logs" {
+  forward_to = [loki.write.default.receiver]
+
+  stage.json {
+    expressions = {
+      level         = "level",
+      message       = "message",
+      correlationId = "correlationId",
+      requestId     = "requestId",
+      postId        = "postId",
+      messageId     = "messageId",
+    }
+  }
+
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+  external_labels = {
+    environment = "local",
+  }
+}

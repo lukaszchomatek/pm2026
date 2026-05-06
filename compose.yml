@@ -166,6 +166,43 @@ services:
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
       FAIL_MODE: none
+
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: loki
+    command: ["-config.file=/etc/loki/config.yml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki-config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.8.3
+    container_name: alloy
+    command: ["run", "/etc/alloy/config.alloy"]
+    depends_on:
+      - loki
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./observability/alloy-config.alloy:/etc/alloy/config.alloy:ro
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    container_name: grafana
+    depends_on:
+      - loki
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+
 volumes:
   mongo_data:
   hf_cache:
+  loki_data:
+  grafana_data:
