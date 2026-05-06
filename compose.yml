@@ -26,19 +26,32 @@ x-hf-service: &hf-service
           - driver: nvidia
             count: 1
             capabilities: [gpu]
+
 services:
   redis:
     image: redis:7-alpine
     container_name: redis
     ports:
       - "6379:6379"
-    command: >
-      sh -c "rabbitmq-plugins enable --offline rabbitmq_prometheus && rabbitmq-server"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: redis-exporter
+    ports:
+      - "9121:9121"
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
 
   mongo:
     image: mongo:8
@@ -54,7 +67,6 @@ services:
       retries: 5
       start_period: 10s
 
-
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
@@ -62,6 +74,8 @@ services:
       - "5672:5672"
       - "15672:15672"
       - "15692:15692"
+    command: >
+      sh -c "rabbitmq-plugins enable --offline rabbitmq_prometheus && rabbitmq-server"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -80,7 +94,8 @@ services:
       JWT_SECRET: super-secret-jwt-key
       LOG_LEVEL: info
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
   posts:
     build: ./posts
@@ -104,6 +119,8 @@ services:
     depends_on:
       mongo:
         condition: service_healthy
+      users:
+        condition: service_started
       sentiment:
         condition: service_healthy
       toxicity:
@@ -115,9 +132,6 @@ services:
 
   sentiment:
     <<: *hf-service
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
     container_name: sentiment
     ports:
       - "8000:8000"
@@ -131,12 +145,12 @@ services:
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
       FAIL_MODE: none
-
-  toxicity:
-    <<: *hf-service
     depends_on:
       rabbitmq:
         condition: service_healthy
+
+  toxicity:
+    <<: *hf-service
     container_name: toxicity
     ports:
       - "8001:8000"
@@ -150,12 +164,12 @@ services:
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
       FAIL_MODE: none
-
-  zeroshot:
-    <<: *hf-service
     depends_on:
       rabbitmq:
         condition: service_healthy
+
+  zeroshot:
+    <<: *hf-service
     container_name: zeroshot
     ports:
       - "8002:8000"
@@ -169,6 +183,9 @@ services:
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
       FAIL_MODE: none
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
   loki:
     image: grafana/loki:3.1.1
@@ -179,6 +196,21 @@ services:
     volumes:
       - ./observability/loki-config.yml:/etc/loki/config.yml:ro
       - loki_data:/loki
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - redis-exporter
+      - rabbitmq
 
   alloy:
     image: grafana/alloy:v1.8.3
@@ -198,16 +230,6 @@ services:
       - ./observability/alloy-config.alloy:/etc/alloy/config.alloy:ro
       - alloy_data:/var/lib/alloy/data
 
-  prometheus:
-    image: prom/prometheus:v2.53.0
-    container_name: prometheus
-    ports:
-      - "9090:9090"
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-    volumes:
-      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-
   grafana:
     image: grafana/grafana:11.1.4
     container_name: grafana
@@ -225,8 +247,10 @@ services:
       - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
 
 volumes:
+  redis_data:
   mongo_data:
   hf_cache:
   loki_data:
+  prometheus_data:
   grafana_data:
   alloy_data:

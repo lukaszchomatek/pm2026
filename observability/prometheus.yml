@@ -21,3 +21,7 @@ scrape_configs:
     static_configs:
       - targets: ["rabbitmq:15692"]
     metrics_path: /metrics
+
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
