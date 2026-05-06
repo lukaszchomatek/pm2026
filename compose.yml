@@ -32,6 +32,8 @@ services:
     container_name: redis
     ports:
       - "6379:6379"
+    command: >
+      sh -c "rabbitmq-plugins enable --offline rabbitmq_prometheus && rabbitmq-server"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -59,6 +61,7 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+      - "15692:15692"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -189,16 +192,28 @@ services:
       - "12345:12345"
     depends_on:
       - loki
+      - prometheus
     volumes:
       - /var/run/docker.sock.raw:/var/run/docker.sock:ro
       - ./observability/alloy-config.alloy:/etc/alloy/config.alloy:ro
       - alloy_data:/var/lib/alloy/data
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
 
   grafana:
     image: grafana/grafana:11.1.4
     container_name: grafana
     depends_on:
       - loki
+      - prometheus
     ports:
       - "3000:3000"
     environment:
@@ -207,6 +222,7 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
 
 volumes:
   mongo_data:

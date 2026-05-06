@@ -9,6 +9,14 @@ from datetime import datetime, timezone
 
 import pika
 
+from app.core.metrics import (
+    classifier_duration_seconds,
+    classifier_errors_total,
+    classifier_messages_consumed_total,
+    classifier_results_published_total,
+    classifier_success_total,
+)
+
 logger = logging.getLogger("hf-inference-service")
 
 REQUEST_ROUTING_KEY = "classification.requested"
@@ -142,6 +150,7 @@ class RabbitClassifierConsumer:
         try:
             event = json.loads(body.decode("utf-8"))
         except Exception as exc:
+            classifier_errors_total.labels(self.config.service_name).inc()
             logger.warning("invalid_json service=%s error=%s", self.config.service_name, str(exc))
             channel.basic_ack(delivery_tag=delivery_tag)
             log_event("info", "message_ack")
@@ -154,12 +163,17 @@ class RabbitClassifierConsumer:
             return
 
         try:
+            classifier_messages_consumed_total.labels(self.config.service_name).inc()
+            started_at = time.perf_counter()
             log_event("info", "message_consumed", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"), textLength=len(event.get("text", "")))
             result_payload = self._process_message(event, properties)
             routing_key = f"classification.result.{self.config.service_name}"
             self._publish(channel, routing_key, result_payload, properties)
+            classifier_success_total.labels(self.config.service_name).inc()
+            classifier_duration_seconds.labels(self.config.service_name).observe(time.perf_counter() - started_at)
             channel.basic_ack(delivery_tag=delivery_tag)
         except TransientProcessingError as exc:
+            classifier_errors_total.labels(self.config.service_name).inc()
             logger.warning(
                 "transient_error_requeue service=%s run=%s error=%s",
                 self.config.service_name,
@@ -169,6 +183,7 @@ class RabbitClassifierConsumer:
             channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
             log_event("info", "message_nack", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"))
         except Exception as exc:
+            classifier_errors_total.labels(self.config.service_name).inc()
             failed_payload = self._build_failed_payload(event, exc, properties)
             routing_key = f"classification.failed.{self.config.service_name}"
             try:
@@ -295,6 +310,8 @@ class RabbitClassifierConsumer:
         message_id = payload.get("messageId") or str(uuid.uuid4())
         body = json.dumps(payload).encode("utf-8")
         log_event("info", "classification_result_published", correlationId=payload.get("correlationId"), postId=payload.get("postId"), messageId=payload.get("messageId"), causationId=payload.get("causationId"))
+        status = payload.get("status", "ok")
+        classifier_results_published_total.labels(self.config.service_name, status).inc()
         channel.basic_publish(
             exchange=self.exchange,
             routing_key=routing_key,

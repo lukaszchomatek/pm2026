@@ -6,10 +6,20 @@ import { QUEUES, ROUTING_KEYS } from "./messaging/classificationTopology.js";
 import { consumeJson, publishJson } from "./messaging/rabbit.js";
 import { logger, errorFields } from "./logger.js";
 import { requestContextMiddleware } from "./requestContext.js";
+import {
+  classificationDuration,
+  classificationFallbacksTotal,
+  classificationResultsTotal,
+  metricsHandler,
+  metricsMiddleware,
+  postsCreatedTotal,
+  postsStatusTotal
+} from "./metrics.js";
 
 const app = express();
 app.use(express.json());
 app.use(requestContextMiddleware);
+app.use(metricsMiddleware);
 
 const PORT = process.env.PORT || 3002;
 const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/postsdb";
@@ -333,7 +343,20 @@ async function finalizeClassificationIfReady(postId, classificationRunId) {
       }
     }
   );
+
+  postsStatusTotal.inc({ status: decision.status });
+  if (post.classificationStartedAt) {
+    const seconds = (now.getTime() - new Date(post.classificationStartedAt).getTime()) / 1000;
+    if (seconds >= 0) classificationDuration.observe({ status: decision.status }, seconds);
+  }
+
+  if (decision.status === POST_STATUS.REVIEW_REQUIRED) {
+    const failed = getClassificationFailures(post);
+    failed.forEach(name => classificationFallbacksTotal.inc({ classifier: name }));
+    if (failed.size === 0) classificationFallbacksTotal.inc({ classifier: "policy" });
+  }
 }
+
 
 async function handleClassificationResult(message, msg, parseError) {
   if (parseError) {
@@ -371,6 +394,7 @@ async function handleClassificationResult(message, msg, parseError) {
   }
 
   const isFailedEvent = event.isFailed || event.payloadStatus === "failed";
+  classificationResultsTotal.inc({ classifier: event.classifier, status: isFailedEvent ? "failed" : "ok" });
 
   if (isFailedEvent) {
     await postsCollection.updateOne(
@@ -438,6 +462,8 @@ async function startResultsConsumer() {
   console.log(`[rabbit] consuming ${QUEUES.POSTS_RESULTS}`);
 }
 
+app.get("/metrics", metricsHandler);
+
 app.get("/health", async (req, res) => {
   try {
     await db.command({ ping: 1 });
@@ -477,6 +503,7 @@ app.post("/posts", authMiddleware, async (req, res) => {
     };
 
     const inserted = await postsCollection.insertOne(pendingPost);
+    postsCreatedTotal.inc();
     logger.info({ event: "post_saved_pending", requestId: req.requestId, correlationId: req.correlationId, postId: inserted.insertedId.toString(), status: POST_STATUS.PENDING_CLASSIFICATION });
 
     try {
