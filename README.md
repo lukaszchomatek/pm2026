@@ -71,10 +71,57 @@ W katalogu głównym projektu:
 docker compose up --build
 ```
 
+Traefik (reverse proxy/load balancer dla `posts`) jest dostępny na:
+- `http://localhost:8080` — ruch HTTP do endpointów `posts`
+- `http://localhost:8081/dashboard/` — dashboard Traefika
+
+### Skalowanie `posts` przez Traefik
+
+Jedna instancja `posts`:
+
+```bash
+docker compose up -d --build
+```
+
+Trzy instancje `posts`:
+
+```bash
+docker compose up -d --build --scale posts=3
+```
+
+Test rozkładu ruchu (uruchom kilka razy i porównaj `instanceId`/`hostname`):
+
+```bash
+curl http://localhost:8080/posts/instance
+```
+
+### Skalowanie konsumenta `toxicity` (RabbitMQ)
+
+Scenariusz A: 1 replika `toxicity`, opóźnienie 3000 ms na wiadomość:
+
+```bash
+docker compose up -d --build --scale toxicity=1
+```
+
+Praktycznie (zalecane w Compose): ustaw w `compose.yml` dla usługi `toxicity`:
+- `TOXICITY_DELAY_MS=3000`
+- `PREFETCH_COUNT=1`
+
+Scenariusz B: 3 repliki `toxicity`, opóźnienie 3000 ms na wiadomość:
+
+```bash
+docker compose up -d --build --scale toxicity=3
+```
+
+Obserwacja długości kolejki w RabbitMQ Management:
+- Otwórz `http://localhost:15672`
+- Przejdź do **Queues**
+- Obserwuj kolejkę `toxicity.requests` (Ready / Unacked) podczas wysyłania postów.
+
 Po uruchomieniu dostępne będą usługi:
 
 - `users` — `http://localhost:3001`
-- `posts` — `http://localhost:3002`
+- `posts` (przez Traefik) — `http://localhost:8080`
 - `hf-model-service (sentiment)` — `http://localhost:8000`
 - `hf-model-service (toxicity)` — `http://localhost:8001`
 - `hf-model-service (zero-shot)` — `http://localhost:8002`
@@ -242,7 +289,7 @@ curl -X POST "http://localhost:3001/login" \
 ### 3. Dodanie posta
 
 ```bash
-curl -X POST "http://localhost:3002/posts" \
+curl -X POST "http://localhost:8080/posts" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer TU_WKLEJ_TOKEN" \
   -d '{
@@ -253,7 +300,7 @@ curl -X POST "http://localhost:3002/posts" \
 ### 4. Pobranie listy postów
 
 ```bash
-curl -X GET "http://localhost:3002/posts"
+curl -X GET "http://localhost:8080/posts"
 ```
 
 ### 5. Backfill klasyfikacji (opcjonalnie)
@@ -275,9 +322,9 @@ Przykładowa odpowiedź:
 
 Topologia klasyfikacji tworzy kolejki główne i `.dlq`:
 
-- `sentiment.classification.requests` + `sentiment.classification.requests.dlq`
-- `toxicity.classification.requests` + `toxicity.classification.requests.dlq`
-- `zeroshot.classification.requests` + `zeroshot.classification.requests.dlq`
+- `sentiment.requests` + `sentiment.requests.dlq`
+- `toxicity.requests` + `toxicity.requests.dlq`
+- `zeroshot.requests` + `zeroshot.requests.dlq`
 - `posts.classification.results` + `posts.classification.results.dlq`
 
 Wszystkie DLQ są podpięte do exchange `classification` przez routing key `classification.dlq.*`.
@@ -389,3 +436,79 @@ Aby usunąć także wolumen MongoDB:
 ```bash
 docker compose down -v
 ```
+
+
+## Wykład 7: skalowanie API i konsumentów kolejek
+
+### Cel wykładu 7
+Pokazać różnicę między skalowaniem warstwy API (`posts`) oraz skalowaniem wolniejszego etapu asynchronicznego (`toxicity`), który wpływa na czas decyzji publikacji/moderacji posta.
+
+### Architektura demonstracyjna
+`client -> Traefik -> posts replicas -> RabbitMQ -> toxicity replicas -> RabbitMQ -> posts`
+
+### Komendy uruchomienia
+Bez skalowania (po 1 replice):
+
+```bash
+docker compose up -d --build
+```
+
+Skalowanie API `posts` do 3 replik:
+
+```bash
+docker compose up -d --scale posts=3
+```
+
+Skalowanie konsumenta `toxicity` do 3 replik:
+
+```bash
+docker compose up -d --scale toxicity=3
+```
+
+Powrót do pojedynczych replik `posts` i `toxicity`:
+
+```bash
+docker compose up -d --scale posts=1 --scale toxicity=1
+```
+
+### Test rozkładu ruchu po `posts`
+Wykonaj kilka razy:
+
+```bash
+curl http://localhost:8080/posts/instance
+```
+
+Przy `posts=3` odpowiedzi powinny rotować po różnych `instanceId`/`hostname`.
+
+### Test wpływu `toxicity=1` vs `toxicity=3` na czas decyzji
+1. Ustaw dla `toxicity` opóźnienie: `TOXICITY_DELAY_MS=3000` (w `compose.yml`).
+2. Uruchom scenariusz A (`toxicity=1`) i wyślij serię postów:
+   - Bash: `./sh_tests/demo_traefik_posts_load.sh`
+   - PowerShell: `./ps_tests/demo_traefik_posts_load.ps1`
+3. Obserwuj długość kolejki `toxicity.requests` w RabbitMQ (`http://localhost:15672`).
+4. Powtórz dla scenariusza B (`toxicity=3`) i porównaj szybkość opróżniania kolejki oraz czas pojawiania się statusów końcowych.
+
+### Competing consumers — co jest poprawne, a co błędne
+- **Poprawne skalowanie:** wiele replik tego samego konsumenta (`toxicity`) na **tej samej kolejce** `toxicity.requests`.
+- **Błędne podejście:** mieszanie różnych klasyfikatorów (`sentiment`, `toxicity`, `zeroshot`) na jednej wspólnej kolejce.
+- W tym projekcie każdy klasyfikator ma osobną kolejkę requestów, więc klasyfikatory się nie „podkradają” nawzajem.
+
+### Materiały pomocnicze (demo)
+- Bash: `sh_tests/demo_traefik_posts_load.sh`
+- PowerShell: `ps_tests/demo_traefik_posts_load.ps1`
+- k6 (opcjonalnie): `sh_tests/k6_posts_via_traefik.js`
+
+Przykład uruchomienia k6:
+
+```bash
+# Najpierw pobierz token np. przez login w users
+k6 run -e BASE_URL=http://localhost:8080 -e TOKEN=<JWT_TOKEN> -e VUS=20 -e DURATION=60s sh_tests/k6_posts_via_traefik.js
+```
+
+### Troubleshooting
+- **Konflikt portów:** sprawdź czy porty 8080, 8081, 15672, 3000, 9090 nie są zajęte przez inne procesy.
+- **`container_name` i skalowanie:** usługi skalowane (`posts`, `toxicity`) nie powinny mieć wymuszonego `container_name`, bo blokuje to repliki.
+- **`unacked messages`:** przy wolnym konsumencie liczba `Unacked` może rosnąć; sprawdź `PREFETCH_COUNT` i opóźnienie `TOXICITY_DELAY_MS`.
+- **Kolejka się nie opróżnia:** zweryfikuj, czy kontenery `toxicity` są healthy i czy nie ma błędów połączenia do RabbitMQ.
+- **Traefik nie widzi usługi:** sprawdź etykiety `traefik.*` na `posts` i czy Traefik ma dostęp do socketa Docker.
+- **Endpoint działa tylko wewnątrz Compose:** upewnij się, że ruch z hosta idzie przez `http://localhost:8080` (Traefik), a nie bezpośrednio na `posts`.

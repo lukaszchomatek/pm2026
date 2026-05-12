@@ -83,11 +83,24 @@ services:
       retries: 5
       start_period: 10s
 
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:8080
+      - --api.dashboard=true
+      - --api.insecure=true
+    ports:
+      - "8080:8080"
+      - "8081:8080"
+    volumes:
+      - /var/run/docker.sock.raw:/var/run/docker.sock:ro
+
   users:
     build: ./users
-    container_name: users
-    ports:
-      - "3001:3001"
+    expose:
+      - "3001"
     environment:
       PORT: 3001
       REDIS_URL: redis://redis:6379
@@ -99,9 +112,15 @@ services:
 
   posts:
     build: ./posts
-    container_name: posts
-    ports:
-      - "3002:3002"
+    # posts is intentionally exposed only inside the Compose network so Traefik
+    # can load-balance multiple replicas (host ports would collide when scaled).
+    expose:
+      - "3002"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.posts.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.posts.entrypoints=web"
+      - "traefik.http.services.posts.loadbalancer.server.port=3002"
     environment:
       PORT: 3002
       MONGO_URL: mongodb://mongo:27017/postsdb
@@ -129,12 +148,13 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      traefik:
+        condition: service_started
 
   sentiment:
     <<: *hf-service
-    container_name: sentiment
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     environment:
       MODEL_REVISION: main
       USE_GPU: "1"
@@ -145,15 +165,16 @@ services:
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
       FAIL_MODE: none
+      PREFETCH_COUNT: "1"
+      TOXICITY_DELAY_MS: "0"
     depends_on:
       rabbitmq:
         condition: service_healthy
 
   toxicity:
     <<: *hf-service
-    container_name: toxicity
-    ports:
-      - "8001:8000"
+    expose:
+      - "8000"
     environment:
       MODEL_REVISION: main
       USE_GPU: "1"
@@ -164,15 +185,16 @@ services:
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
       FAIL_MODE: none
+      PREFETCH_COUNT: "1"
+      TOXICITY_DELAY_MS: "0"
     depends_on:
       rabbitmq:
         condition: service_healthy
 
   zeroshot:
     <<: *hf-service
-    container_name: zeroshot
-    ports:
-      - "8002:8000"
+    expose:
+      - "8000"
     environment:
       MODEL_REVISION: main
       USE_GPU: "1"
@@ -183,6 +205,8 @@ services:
       RABBITMQ_URL: amqp://rabbitmq:5672
       CLASSIFICATION_EXCHANGE: classification
       FAIL_MODE: none
+      PREFETCH_COUNT: "1"
+      TOXICITY_DELAY_MS: "0"
     depends_on:
       rabbitmq:
         condition: service_healthy

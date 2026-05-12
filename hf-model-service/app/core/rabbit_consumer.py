@@ -18,12 +18,13 @@ from app.core.metrics import (
 )
 
 logger = logging.getLogger("hf-inference-service")
+INSTANCE_ID = os.getenv("INSTANCE_ID") or os.getenv("HOSTNAME") or "local"
 
 REQUEST_ROUTING_KEY = "classification.requested"
 QUEUE_NAMES = {
-    "sentiment": "sentiment.classification.requests",
-    "toxicity": "toxicity.classification.requests",
-    "zeroshot": "zeroshot.classification.requests",
+    "sentiment": "sentiment.requests",
+    "toxicity": "toxicity.requests",
+    "zeroshot": "zeroshot.requests",
 }
 
 
@@ -40,7 +41,7 @@ class PermanentProcessingError(Exception):
 
 
 def log_event(level, event, **fields):
-    payload = {"event": event, "service": os.getenv("SERVICE_KIND", "classifier"), **fields}
+    payload = {"event": event, "service": os.getenv("SERVICE_KIND", "classifier"), "instanceId": INSTANCE_ID, **fields}
     line = json.dumps(payload, default=str)
     getattr(logger, level)(line)
 
@@ -55,6 +56,8 @@ class RabbitClassifierConsumer:
         self.exchange = os.getenv("CLASSIFICATION_EXCHANGE", "classification")
         self.rabbitmq_url = os.getenv("RABBITMQ_URL", "amqp://localhost:5672")
         self.fail_mode = os.getenv("FAIL_MODE", "none").strip().lower() or "none"
+        self.prefetch_count = max(1, int(os.getenv("PREFETCH_COUNT", "1")))
+        self.toxicity_delay_ms = max(0, int(os.getenv("TOXICITY_DELAY_MS", "0")))
 
         self.queue_name = QUEUE_NAMES.get(config.service_name)
         if not self.queue_name:
@@ -85,7 +88,7 @@ class RabbitClassifierConsumer:
 
                 connection = pika.BlockingConnection(params)
                 channel = connection.channel()
-                channel.basic_qos(prefetch_count=1)
+                channel.basic_qos(prefetch_count=self.prefetch_count)
 
                 classifier_name = self.config.service_name
                 dead_letter_routing_key = technical_dlq_routing_key(classifier_name)
@@ -102,14 +105,17 @@ class RabbitClassifierConsumer:
                 channel.queue_bind(queue=self.queue_name, exchange=self.exchange, routing_key=REQUEST_ROUTING_KEY)
 
                 logger.info(
-                    "rabbit_consumer_started service=%s exchange=%s queue=%s routing_key=%s dead_letter_exchange=%s dead_letter_routing_key=%s fail_mode=%s",
+                    "rabbit_consumer_started service=%s instance_id=%s exchange=%s queue=%s routing_key=%s dead_letter_exchange=%s dead_letter_routing_key=%s fail_mode=%s prefetch_count=%s toxicity_delay_ms=%s",
                     classifier_name,
+                    INSTANCE_ID,
                     self.exchange,
                     self.queue_name,
                     REQUEST_ROUTING_KEY,
                     self.exchange,
                     dead_letter_routing_key,
                     self.fail_mode,
+                    self.prefetch_count,
+                    self.toxicity_delay_ms,
                 )
 
                 while not self._stop_event.is_set():
@@ -118,20 +124,21 @@ class RabbitClassifierConsumer:
                         time.sleep(0.2)
                         continue
 
-                    self._handle_delivery(channel, method.delivery_tag, body, properties)
+                    self._handle_delivery(channel, method, body, properties)
 
                 backoff_seconds = 1
             except pika.exceptions.AMQPConnectionError as exc:
                 logger.warning(
-                    "rabbit_consumer_connection_retry service=%s backoff=%ss error=%s",
+                    "rabbit_consumer_connection_retry service=%s instance_id=%s backoff=%ss error=%s",
                     self.config.service_name,
+                    INSTANCE_ID,
                     backoff_seconds,
                     str(exc) or exc.__class__.__name__,
                 )
                 time.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 10)
             except Exception:
-                logger.exception("rabbit_consumer_connection_error service=%s", self.config.service_name)
+                logger.exception("rabbit_consumer_connection_error service=%s instance_id=%s", self.config.service_name, INSTANCE_ID)
                 time.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 10)
             finally:
@@ -146,37 +153,42 @@ class RabbitClassifierConsumer:
                     except Exception:
                         pass
 
-    def _handle_delivery(self, channel, delivery_tag, body, properties):
+    def _handle_delivery(self, channel, method, body, properties):
+        delivery_tag = method.delivery_tag
         try:
             event = json.loads(body.decode("utf-8"))
         except Exception as exc:
             classifier_errors_total.labels(self.config.service_name).inc()
-            logger.warning("invalid_json service=%s error=%s", self.config.service_name, str(exc))
+            logger.warning("invalid_json service=%s instance_id=%s error=%s", self.config.service_name, INSTANCE_ID, str(exc))
             channel.basic_ack(delivery_tag=delivery_tag)
             log_event("info", "message_ack")
             return
 
         requested = event.get("requestedClassifiers")
         if isinstance(requested, list) and self.config.service_name not in requested:
-            logger.info("classifier_skipped service=%s run=%s", self.config.service_name, event.get("classificationRunId"))
+            logger.info("classifier_skipped service=%s instance_id=%s run=%s", self.config.service_name, INSTANCE_ID, event.get("classificationRunId"))
             channel.basic_ack(delivery_tag=delivery_tag)
             return
 
         try:
             classifier_messages_consumed_total.labels(self.config.service_name).inc()
             started_at = time.perf_counter()
-            log_event("info", "message_consumed", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"), textLength=len(event.get("text", "")))
-            result_payload = self._process_message(event, properties)
+            redelivered = bool(getattr(method, "redelivered", False))
+            log_event("info", "message_consumed", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"), textLength=len(event.get("text", "")), redelivered=redelivered)
+            result_payload = self._process_message(event, properties, redelivered=redelivered)
             routing_key = f"classification.result.{self.config.service_name}"
             self._publish(channel, routing_key, result_payload, properties)
             classifier_success_total.labels(self.config.service_name).inc()
-            classifier_duration_seconds.labels(self.config.service_name).observe(time.perf_counter() - started_at)
+            processing_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            classifier_duration_seconds.labels(self.config.service_name).observe(processing_ms / 1000)
             channel.basic_ack(delivery_tag=delivery_tag)
+            log_event("info", "message_ack", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"), redelivered=redelivered, processingMs=processing_ms)
         except TransientProcessingError as exc:
             classifier_errors_total.labels(self.config.service_name).inc()
             logger.warning(
-                "transient_error_requeue service=%s run=%s error=%s",
+                "transient_error_requeue service=%s instance_id=%s run=%s error=%s",
                 self.config.service_name,
+                INSTANCE_ID,
                 event.get("classificationRunId"),
                 str(exc),
             )
@@ -189,15 +201,16 @@ class RabbitClassifierConsumer:
             try:
                 self._publish(channel, routing_key, failed_payload, properties)
             except Exception:
-                logger.exception("failed_publish_failed_event service=%s", self.config.service_name)
+                logger.exception("failed_publish_failed_event service=%s instance_id=%s", self.config.service_name, INSTANCE_ID)
                 channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
                 return
 
             channel.basic_ack(delivery_tag=delivery_tag)
 
-    def _process_message(self, event, properties):
+    def _process_message(self, event, properties, redelivered=False):
         self._validate_event(event)
-        log_event("info", "classification_started", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"))
+        log_event("info", "classification_started", correlationId=event.get("correlationId"), postId=event.get("postId"), messageId=event.get("messageId"), redelivered=redelivered)
+        self._apply_toxicity_delay()
         self._apply_fail_mode()
 
         model = self.model_getter(
@@ -305,6 +318,15 @@ class RabbitClassifierConsumer:
 
         if self.fail_mode == "random" and random.random() < 0.4:
             raise TransientProcessingError("simulated random transient failure (FAIL_MODE=random)")
+
+    def _apply_toxicity_delay(self):
+        if self.config.service_name != "toxicity":
+            return
+
+        if self.toxicity_delay_ms <= 0:
+            return
+
+        time.sleep(self.toxicity_delay_ms / 1000)
 
     def _publish(self, channel, routing_key, payload, properties):
         message_id = payload.get("messageId") or str(uuid.uuid4())

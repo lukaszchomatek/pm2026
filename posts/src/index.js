@@ -4,7 +4,7 @@ import { ObjectId, MongoClient } from "mongodb";
 import { bootstrapRabbitMQ } from "./messaging/bootstrapRabbitMQ.js";
 import { QUEUES, ROUTING_KEYS } from "./messaging/classificationTopology.js";
 import { consumeJson, publishJson } from "./messaging/rabbit.js";
-import { logger, errorFields } from "./logger.js";
+import { logger, errorFields, instanceId } from "./logger.js";
 import { requestContextMiddleware } from "./requestContext.js";
 import {
   classificationDuration,
@@ -463,6 +463,15 @@ async function startResultsConsumer() {
 }
 
 app.get("/metrics", metricsHandler);
+
+app.get("/posts/instance", (req, res) => {
+  res.json({
+    service: "posts",
+    instanceId,
+    hostname: process.env.HOSTNAME || null,
+    pid: process.pid
+  });
+});
 
 app.get("/health", async (req, res) => {
   try {

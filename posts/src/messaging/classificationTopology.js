@@ -21,9 +21,9 @@ export function technicalDlqRoutingKey(classifierName) {
 }
 
 export const QUEUES = Object.freeze({
-  SENTIMENT_REQUESTS: "sentiment.classification.requests",
-  TOXICITY_REQUESTS: "toxicity.classification.requests",
-  ZEROSHOT_REQUESTS: "zeroshot.classification.requests",
+  SENTIMENT_REQUESTS: "sentiment.requests",
+  TOXICITY_REQUESTS: "toxicity.requests",
+  ZEROSHOT_REQUESTS: "zeroshot.requests",
   POSTS_RESULTS: "posts.classification.results"
 });
 
