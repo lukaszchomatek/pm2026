@@ -99,8 +99,8 @@ services:
 
   users:
     build: ./users
-    expose:
-      - "3001"
+    ports:
+      - "3001:3001"
     environment:
       PORT: 3001
       REDIS_URL: redis://redis:6379
