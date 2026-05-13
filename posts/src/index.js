@@ -628,6 +628,36 @@ app.post("/admin/classification/backfill", async (req, res) => {
   }
 });
 
+
+app.get("/posts/:id/status", async (req, res) => {
+  try {
+    const postId = req.params.id;
+    if (!ObjectId.isValid(postId)) {
+      return res.status(400).json({ error: "invalid post id" });
+    }
+
+    const post = await postsCollection.findOne(
+      { _id: new ObjectId(postId) },
+      { projection: { _id: 1, status: 1, statusReason: 1, createdAt: 1, updatedAt: 1 } }
+    );
+
+    if (!post) {
+      return res.status(404).json({ error: "post not found" });
+    }
+
+    return res.json({
+      id: post._id,
+      status: post.status,
+      statusReason: post.statusReason ?? null,
+      createdAt: post.createdAt ?? null,
+      updatedAt: post.updatedAt ?? null
+    });
+  } catch (err) {
+    logger.error({ event: "post_status_failed", requestId: req.requestId, correlationId: req.correlationId, ...errorFields(err) });
+    return res.status(500).json({ error: "internal error" });
+  }
+});
+
 app.get("/posts", async (req, res) => {
   try {
     const statusQuery = typeof req.query.status === "string" ? req.query.status.trim() : "";

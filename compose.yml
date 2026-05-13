@@ -229,6 +229,7 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -253,6 +254,30 @@ services:
       - /var/run/docker.sock.raw:/var/run/docker.sock:ro
       - ./observability/alloy-config.alloy:/etc/alloy/config.alloy:ro
       - alloy_data:/var/lib/alloy/data
+
+
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    volumes:
+      - ./load-tests:/scripts:ro
+    environment:
+      BASE_URL: http://traefik
+      USERS_URL: http://users:3001
+      USERNAME_PREFIX: k6_demo_user
+      PASSWORD: demo_pass
+      POSTS_COUNT: "30"
+      VUS: "1"
+      POLL_STATUS: "false"
+      STATUS_TIMEOUT_MS: "60000"
+      STATUS_POLL_INTERVAL_MS: "1000"
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_TREND_STATS: p(90),p(95),p(99),avg,min,max
+      K6_PROMETHEUS_RW_STALE_MARKERS: "true"
+    depends_on:
+      - traefik
+      - users
+      - prometheus
 
   grafana:
     image: grafana/grafana:11.1.4
