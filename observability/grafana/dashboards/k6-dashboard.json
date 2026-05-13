@@ -1,5 +1,5 @@
 {
-  "annotations": {"list": []},
+  "annotations": { "list": [] },
   "editable": true,
   "schemaVersion": 39,
   "style": "dark",
@@ -12,13 +12,19 @@
       {
         "name": "testid",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "prometheus"},
-        "definition": "label_values(demo_posts_created, testid)",
-        "query": {"query": "label_values(demo_posts_created, testid)"},
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values(k6_demo_posts_created_total, k6_testid)",
+        "query": {
+          "query": "label_values(k6_demo_posts_created_total, k6_testid)"
+        },
         "refresh": 2,
         "includeAll": true,
         "multi": false,
-        "current": {"selected": true, "text": "All", "value": "$__all"}
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ".*"
+        }
       }
     ]
   },
@@ -26,25 +32,33 @@
     {
       "type": "stat",
       "title": "Posts created",
-      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 5},
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"expr": "sum(demo_posts_created{testid=~\"$testid\"})"}]
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(k6_demo_posts_created_total{k6_testid=~\"$testid\"})"
+        }
+      ]
     },
     {
       "type": "stat",
       "title": "Post create failed",
-      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 5},
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"expr": "sum(demo_post_create_failed{testid=~\"$testid\"})"}]
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(k6_demo_post_create_failed_total{k6_testid=~\"$testid\"})"
+        }
+      ]
     },
     {
       "type": "timeseries",
       "title": "Create posts RPS",
-      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "sum(rate(k6_http_reqs_total{endpoint=\"posts_create\",testid=~\"$testid\"}[1m]))",
+          "expr": "sum(rate(k6_http_reqs_total{k6_endpoint=\"posts_create\",k6_testid=~\"$testid\"}[1m]))",
           "legendFormat": "posts_create rps"
         }
       ]
@@ -52,31 +66,39 @@
     {
       "type": "timeseries",
       "title": "HTTP req duration (posts_create)",
-      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(k6_http_req_duration_seconds_bucket{endpoint=\"posts_create\",testid=~\"$testid\"}[5m])))",
+          "expr": "avg(k6_http_req_duration_p95{k6_endpoint=\"posts_create\",k6_testid=~\"$testid\"})",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(k6_http_req_duration_seconds_bucket{endpoint=\"posts_create\",testid=~\"$testid\"}[5m])))",
+          "expr": "avg(k6_http_req_duration_p99{k6_endpoint=\"posts_create\",k6_testid=~\"$testid\"})",
           "legendFormat": "p99"
+        },
+        {
+          "expr": "avg(k6_http_req_duration_avg{k6_endpoint=\"posts_create\",k6_testid=~\"$testid\"})",
+          "legendFormat": "avg"
         }
       ]
     },
     {
       "type": "timeseries",
       "title": "Moderation decision duration",
-      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "avg(demo_moderation_decision_duration{testid=~\"$testid\"})",
+          "expr": "avg(k6_demo_moderation_decision_duration_avg{k6_testid=~\"$testid\"})",
           "legendFormat": "avg"
         },
         {
-          "expr": "max(demo_moderation_decision_duration{testid=~\"$testid\"})",
+          "expr": "avg(k6_demo_moderation_decision_duration_p95{k6_testid=~\"$testid\"})",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "max(k6_demo_moderation_decision_duration_max{k6_testid=~\"$testid\"})",
           "legendFormat": "max"
         }
       ]
